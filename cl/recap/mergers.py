@@ -1544,7 +1544,9 @@ async def clean_duplicate_attachment_entries(
     :param attachment_dicts: A list of Juriscraper-parsed dicts for each
     attachment.
     """
-    rds = RECAPDocument.objects.filter(docket_entry=de)
+    rds = RECAPDocument.objects.filter(
+        docket_entry=de, document_type=RECAPDocument.ATTACHMENT
+    )
 
     dupe_doc_ids = (
         rds.values("pacer_doc_id")
