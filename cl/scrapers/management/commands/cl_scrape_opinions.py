@@ -293,7 +293,9 @@ class Command(ScraperCommand):
         if item.get("content"):
             content = item.pop("content")
         else:
-            content = get_binary_content(item["download_urls"], site)
+            content = async_to_sync(get_binary_content)(
+                item["download_urls"], site
+            )
 
         # request.content is sometimes a str, sometimes unicode, so
         # force it all to be bytes, pleasing hashlib.

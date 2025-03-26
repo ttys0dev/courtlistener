@@ -114,7 +114,7 @@ boto3 = "^1.37.20"
 django-tailwind = "^3.8.0"
 drf-dynamic-fields = "^0.4.0"
 django-ses = {extras = ["events"], version = "^4.4.0"}
-juriscraper = "^2.6.26"
+juriscraper = {git = "https://github.com/ttys0dev/juriscraper.git", rev = "f3708eae4afb3dc269bb2edc73a0930b4e9dd653"}
 
 
 [tool.poetry.group.dev.dependencies]

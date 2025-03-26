@@ -5,6 +5,7 @@ from itertools import batched, chain
 from typing import Any, Dict, List, Set, TypedDict, Union
 
 import eyecite
+from asgiref.sync import sync_to_async
 from dateutil import parser
 from dateutil.rrule import DAILY, rrule
 from django.conf import settings
@@ -20,7 +21,7 @@ from django.views.decorators.cache import cache_page
 from django.views.decorators.vary import vary_on_headers
 from django_ratelimit.core import get_header
 from eyecite.tokenizers import HyperscanTokenizer
-from requests import Response
+from httpx import Response
 from rest_framework import serializers
 from rest_framework.exceptions import Throttled
 from rest_framework.metadata import SimpleMetadata
@@ -886,7 +887,7 @@ def get_next_webhook_retry_date(retry_counter: int) -> datetime:
 WEBHOOK_MAX_RETRY_COUNTER = 7
 
 
-def check_webhook_failure_count_and_notify(
+async def check_webhook_failure_count_and_notify(
     webhook_event: WebhookEvent,
 ) -> None:
     """Check if a Webhook needs to be disabled and/or send a notification about
@@ -909,7 +910,7 @@ def check_webhook_failure_count_and_notify(
         6: False,
         7: True,  # Send webhook disabled notification
     }
-    webhook = webhook_event.webhook
+    webhook = await Webhook.objects.aget(pk=webhook_event.webhook_id)
     if not webhook.enabled or webhook_event.debug:
         return
 
@@ -919,36 +920,36 @@ def check_webhook_failure_count_and_notify(
     current_try_counter = webhook_event.retry_counter
     notify = notify_on[current_try_counter]
     if notify:
-        oldest_enqueued_for_retry = WebhookEvent.objects.filter(
-            webhook=webhook_event.webhook,
+        oldest_enqueued_for_retry = await WebhookEvent.objects.filter(
+            webhook=webhook,
             event_status=WEBHOOK_EVENT_STATUS.ENQUEUED_RETRY,
             debug=False,
-        ).earliest("date_created")
+        ).aearliest("date_created")
         if current_try_counter >= WEBHOOK_MAX_RETRY_COUNTER:
             webhook.enabled = False
             update_fields.append("enabled")
             update_fields.append("date_modified")
             # If the parent webhook is disabled mark all current ENQUEUED_RETRY
             # events as ENDPOINT_DISABLED
-            WebhookEvent.objects.filter(
-                webhook=webhook_event.webhook,
+            await WebhookEvent.objects.filter(
+                webhook=webhook,
                 event_status=WEBHOOK_EVENT_STATUS.ENQUEUED_RETRY,
                 debug=False,
-            ).update(
+            ).aupdate(
                 event_status=WEBHOOK_EVENT_STATUS.ENDPOINT_DISABLED,
                 date_modified=now(),
             )
         if oldest_enqueued_for_retry.pk == webhook_event.pk:
             failure_counter = current_try_counter + 1
-            notify_failing_webhook.delay(
+            await sync_to_async(notify_failing_webhook.delay)(
                 webhook_event.pk, failure_counter, webhook.enabled
             )
 
     # Save webhook and avoid emailing admins via signal in cl.users.signals
-    webhook.save(update_fields=update_fields)
+    await webhook.asave(update_fields=update_fields)
 
 
-def update_webhook_event_after_request(
+async def update_webhook_event_after_request(
     webhook_event: WebhookEvent,
     response: Response | None = None,
     error: str | None = "",
@@ -973,10 +974,10 @@ def update_webhook_event_after_request(
         # The webhook response is consumed as a stream to avoid blocking the
         # process and overflowing memory on huge responses. We only read and
         # store the first 4KB
-        for chunk in response.iter_content(1024 * 4, decode_unicode=True):
+        async for chunk in response.aiter_text(1024 * 4):
             data = chunk
             break
-        response.close()
+        await response.aclose()
         status_code = response.status_code
         # If the response status code is not 2xx. It's considered a failed
         # attempt, and it'll be enqueued for retry.
@@ -989,12 +990,12 @@ def update_webhook_event_after_request(
         if error is None:
             error = ""
         webhook_event.error_message = error
-        check_webhook_failure_count_and_notify(webhook_event)
+        await check_webhook_failure_count_and_notify(webhook_event)
         if webhook_event.retry_counter >= WEBHOOK_MAX_RETRY_COUNTER:
             # If the webhook has reached the max retry counter, mark as failed
             webhook_event.event_status = WEBHOOK_EVENT_STATUS.FAILED
             webhook_event.retry_counter = F("retry_counter") + 1
-            webhook_event.save()
+            await webhook_event.asave()
             return
 
         webhook_event.next_retry_date = get_next_webhook_retry_date(
@@ -1011,7 +1012,7 @@ def update_webhook_event_after_request(
             # Only log successful webhook events and not debug.
             results = log_webhook_event(webhook_event.webhook.user.pk)
             handle_webhook_events(results, webhook_event.webhook.user)
-    webhook_event.save()
+    await webhook_event.asave()
 
 
 class WebhookKeyType(TypedDict):

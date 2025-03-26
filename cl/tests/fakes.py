@@ -1,5 +1,5 @@
 from datetime import date
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from requests.exceptions import HTTPError, Timeout
 
@@ -57,7 +57,7 @@ class FakePossibleCaseNumberApi:
     def __init__(self, *args, **kwargs):
         pass
 
-    def query(self, *args, **kwargs):
+    async def query(self, *args, **kwargs):
         pass
 
     def data(self, *args, **kwargs):
@@ -76,7 +76,7 @@ class FakeAttachmentPage:
     def __init__(self, *args, **kwargs):
         pass
 
-    def query(self, *args, **kwargs):
+    async def query(self, *args, **kwargs):
         pass
 
     @property
@@ -95,7 +95,7 @@ class FakeAppellateAttachmentPage:
     def __init__(self, *args, **kwargs):
         pass
 
-    def query(self, *args, **kwargs):
+    async def query(self, *args, **kwargs):
         pass
 
     @property
@@ -111,10 +111,10 @@ class FakeFreeOpinionReport:
     def __init__(self, *args, **kwargs):
         pass
 
-    def download_pdf(self, *args, **kwargs) -> tuple[MagicMock, str]:
-        return MagicMock(content=b""), ""
+    async def download_pdf(self, *args, **kwargs) -> tuple[AsyncMock, str]:
+        return AsyncMock(content=b""), ""
 
-    def query(self, *args, **kwargs):
+    async def query(self, *args, **kwargs):
         pass
 
     @property
@@ -204,7 +204,7 @@ class FakeCaseQueryReport:
         self.pacer_case_id = None
         self.court_id = court_id
 
-    def query(self, pacer_case_id):
+    async def query(self, pacer_case_id):
         self.pacer_case_id = pacer_case_id
 
     @property

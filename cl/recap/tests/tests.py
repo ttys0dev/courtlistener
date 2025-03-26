@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 from unittest.mock import ANY, MagicMock
 
+import httpx
 import time_machine
 from asgiref.sync import async_to_sync, sync_to_async
 from dateutil.tz import tzutc
@@ -23,7 +24,6 @@ from django.test import RequestFactory
 from django.urls import reverse
 from django.utils.timezone import now
 from juriscraper.pacer import PacerRssFeed
-from requests import ConnectionError
 
 from cl.alerts.factories import DocketAlertFactory
 from cl.api.factories import (
@@ -147,7 +147,6 @@ from cl.tests.utils import (
     AsyncAPIClient,
     MockACMSAttachmentPage,
     MockACMSDocketReport,
-    MockResponse,
 )
 from cl.users.factories import (
     UserProfileWithParentsFactory,
@@ -2116,10 +2115,10 @@ class ReplicateRecapUploadsTest(TestCase):
     )
     @mock.patch(
         "cl.recap.tasks.download_pacer_pdf_by_rd",
-        side_effect=lambda z, x, c, v, b, de_seq_num: (
-            MockResponse(
+        return_value=(
+            httpx.Response(
                 200,
-                b"pdf content",
+                content=b"pdf content",
             ),
             "OK",
         ),
@@ -2229,10 +2228,10 @@ class ReplicateRecapUploadsTest(TestCase):
     )
     @mock.patch(
         "cl.recap.tasks.download_pacer_pdf_by_rd",
-        side_effect=lambda z, x, c, v, b, de_seq_num: (
-            MockResponse(
+        return_value=(
+            httpx.Response(
                 200,
-                b"pdf content",
+                content=b"pdf content",
             ),
             "OK",
         ),
@@ -2963,7 +2962,7 @@ class RecapPdfFetchApiTest(TestCase):
         wraps=is_appellate_court,
     )
     @mock.patch("cl.scrapers.tasks.extract_recap_pdf_base")
-    def test_fetch_unavailable_pdf_district(
+    async def test_fetch_unavailable_pdf_district(
         self,
         mock_extract,
         mock_court_check,
@@ -2974,16 +2973,16 @@ class RecapPdfFetchApiTest(TestCase):
     ):
         """Can we do a simple fetch of a PDF from PACER?"""
         self.rd.is_available = False
-        self.rd.save()
+        await self.rd.asave()
 
         self.assertFalse(self.rd.is_available)
-        result = do_pacer_fetch(self.fq)
+        result = await sync_to_async(do_pacer_fetch)(self.fq)
         result.get()
 
         # Verify that the download helper is invoked exactly once (ideal
         # scenario) with the anticipated district record data.
-        mock_download_method.assert_called_once()
-        mock_download_method.assert_called_with(
+        mock_download_method.assert_awaited_once()
+        mock_download_method.assert_awaited_with(
             self.rd.pk,
             self.docket.pacer_case_id,
             self.rd.pacer_doc_id,
@@ -2996,8 +2995,8 @@ class RecapPdfFetchApiTest(TestCase):
         court_id = self.district_court.id
         mock_court_check.assert_called_with(court_id)
 
-        self.fq.refresh_from_db()
-        self.rd.refresh_from_db()
+        await self.fq.arefresh_from_db()
+        await self.rd.arefresh_from_db()
         self.assertEqual(self.fq.status, PROCESSING_STATUS.SUCCESSFUL)
         self.assertTrue(self.rd.is_available)
         mock_extract.assert_called_once()
@@ -5041,8 +5040,8 @@ class RecapDocketAttachmentTaskTest(TestCase):
         self.assertEqual(self.pq.status, PROCESSING_STATUS.SUCCESSFUL)
 
     @mock.patch(
-        "cl.api.webhooks.requests.post",
-        side_effect=lambda *args, **kwargs: MockResponse(200, mock_raw=True),
+        "cl.api.webhooks.httpx.AsyncClient.post",
+        return_value=httpx.Response(200, stream=ContentFile("OK")),
     )
     def test_main_document_doesnt_match_attachment_zero_on_creation(
         self,
@@ -5100,8 +5099,8 @@ class RecapDocketAttachmentTaskTest(TestCase):
         self.assertEqual(attachment_1.description, "Attachment 1")
 
     @mock.patch(
-        "cl.api.webhooks.requests.post",
-        side_effect=lambda *args, **kwargs: MockResponse(200, mock_raw=True),
+        "cl.api.webhooks.httpx.AsyncClient.post",
+        return_value=httpx.Response(200, stream=ContentFile("OK")),
     )
     def test_main_document_doesnt_match_attachment_zero_existing(
         self,
@@ -5184,8 +5183,8 @@ class RecapDocketAttachmentTaskTest(TestCase):
         self.assertEqual(attachment_1.description, "Attachment 1")
 
     @mock.patch(
-        "cl.api.webhooks.requests.post",
-        side_effect=lambda *args, **kwargs: MockResponse(200, mock_raw=True),
+        "cl.api.webhooks.httpx.AsyncClient.post",
+        return_value=httpx.Response(200, stream=ContentFile("OK")),
     )
     def test_main_rd_lookup_fallback_for_attachment_merging(
         self,
@@ -5902,10 +5901,8 @@ class WebhooksRetries(TestCase):
             next_retry_date=fake_now + timedelta(minutes=3),
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             # Try to retry on the exact time, 3 minutes later.
             next_retry_date = fake_now + timedelta(minutes=3)
@@ -5962,10 +5959,8 @@ class WebhooksRetries(TestCase):
         )
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, raw=self.file_stream
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             next_retry_date = fake_now + timedelta(minutes=1)
             with time_machine.travel(next_retry_date, tick=False):
@@ -6047,9 +6042,9 @@ class WebhooksRetries(TestCase):
         webhook_e1_compare = WebhookEvent.objects.filter(pk=webhook_e1.id)
         for status_code, expected_event_status in status_codes_tests:
             with mock.patch(
-                "cl.api.webhooks.requests.post",
-                side_effect=lambda *args, **kwargs: MockResponse(
-                    status_code, raw=self.file_stream
+                "cl.api.webhooks.httpx.AsyncClient.post",
+                return_value=httpx.Response(
+                    status_code, stream=self.file_stream
                 ),
             ):
                 next_retry_date = fake_now + timedelta(minutes=3)
@@ -6084,12 +6079,11 @@ class WebhooksRetries(TestCase):
         after receiving an HttpResponse with a failure status code.
         """
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(
                 500,
-                raw=self.file_stream_error,
-                reason="500 Server Error",
-                url="https://example.com",
+                stream=self.file_stream_error,
+                request=httpx.Request("POST", url="https://example.com"),
             ),
         ):
             fake_now_0 = now()
@@ -6140,7 +6134,7 @@ class WebhooksRetries(TestCase):
 
     @mock.patch(
         "cl.recap.tasks.download_pdf_by_magic_number",
-        side_effect=lambda z, x, c, v, b, d, e: (None, ""),
+        return_value=(None, ""),
     )
     async def test_update_webhook_after_network_error(
         self,
@@ -6157,10 +6151,8 @@ class WebhooksRetries(TestCase):
         """
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: exec(
-                "raise ConnectionError('Connection Error')"
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            side_effect=httpx.NetworkError("Connection Error"),
         ):
             fake_now_0 = now()
             with time_machine.travel(fake_now_0, tick=False):
@@ -6193,7 +6185,7 @@ class WebhooksRetries(TestCase):
                 self.assertEqual(webhook_triggered_first.status_code, None)
                 self.assertEqual(
                     webhook_triggered_first.error_message,
-                    "ConnectionError: Connection Error",
+                    httpx.NetworkError("Connection Error"),
                 )
 
                 # Is the webhook event updated for retry?
@@ -6213,7 +6205,7 @@ class WebhooksRetries(TestCase):
 
     @mock.patch(
         "cl.recap.tasks.download_pdf_by_magic_number",
-        side_effect=lambda z, x, c, v, b, d, e: (None, ""),
+        return_value=(None, ""),
     )
     async def test_success_webhook_delivery(
         self,
@@ -6230,10 +6222,8 @@ class WebhooksRetries(TestCase):
         """
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, raw=self.file_stream
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=self.file_stream),
         ):
             fake_now_0 = now()
             with time_machine.travel(fake_now_0, tick=False):
@@ -6279,7 +6269,7 @@ class WebhooksRetries(TestCase):
 
     @mock.patch(
         "cl.recap.tasks.download_pdf_by_magic_number",
-        side_effect=lambda z, x, c, v, b, d, e: (None, ""),
+        return_value=(None, ""),
     )
     async def test_retry_webhooks_integration(
         self,
@@ -6297,10 +6287,8 @@ class WebhooksRetries(TestCase):
         """
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                500, raw=self.file_stream
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(500, stream=self.file_stream),
         ):
             fake_now_0 = now()
             with time_machine.travel(fake_now_0, tick=False):
@@ -6456,10 +6444,8 @@ class WebhooksRetries(TestCase):
         webhook_e2_compare = WebhookEvent.objects.filter(pk=webhook_e2.id)
         for try_count, notification_out, webhook_enabled in iterations:
             with mock.patch(
-                "cl.api.webhooks.requests.post",
-                side_effect=lambda *args, **kwargs: MockResponse(
-                    500, mock_raw=True
-                ),
+                "cl.api.webhooks.httpx.AsyncClient.post",
+                return_value=httpx.Response(500, stream=ContentFile("OK")),
             ):
                 next_retry_date = fake_now + timedelta(minutes=3)
                 with time_machine.travel(next_retry_date, tick=False):
@@ -6586,10 +6572,8 @@ class WebhooksRetries(TestCase):
         webhook_compare = Webhook.objects.filter(pk=self.webhook.pk)
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                500, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(500, stream=ContentFile("OK")),
         ):
             # Today - HOURS_WEBHOOKS_CUT_OFF hours
             next_retry_date = fake_now_minus_2 + timedelta(minutes=3)
@@ -6616,10 +6600,8 @@ class WebhooksRetries(TestCase):
                 self.assertEqual(webhooks_to_retry, 0)
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             fake_now_3 = fake_now + timedelta(
                 hours=HOURS_WEBHOOKS_CUT_OFF + 12
@@ -6695,10 +6677,8 @@ class WebhooksRetries(TestCase):
         for try_count, notification_out in iterations:
             # Try to deliver webhook_e1 and webhook_e2 4 times.
             with mock.patch(
-                "cl.api.webhooks.requests.post",
-                side_effect=lambda *args, **kwargs: MockResponse(
-                    500, mock_raw=True
-                ),
+                "cl.api.webhooks.httpx.AsyncClient.post",
+                return_value=httpx.Response(500, stream=ContentFile("OK")),
             ):
                 next_retry_date = fake_now + timedelta(minutes=3)
                 with time_machine.travel(next_retry_date, tick=False):
@@ -6720,10 +6700,8 @@ class WebhooksRetries(TestCase):
                         )
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             # Deliver webhook_e1 successfully.
             next_retry_date = fake_now + timedelta(minutes=3)
@@ -6746,10 +6724,8 @@ class WebhooksRetries(TestCase):
         # 6th try, and disable the webhook endpoint on the 8th try.
         for try_count, notification_out, webhook_enabled in iterations:
             with mock.patch(
-                "cl.api.webhooks.requests.post",
-                side_effect=lambda *args, **kwargs: MockResponse(
-                    500, mock_raw=True
-                ),
+                "cl.api.webhooks.httpx.AsyncClient.post",
+                return_value=httpx.Response(500, stream=ContentFile("OK")),
             ):
                 next_retry_date = fake_now + timedelta(minutes=6)
                 with time_machine.travel(next_retry_date, tick=False):
@@ -6879,10 +6855,8 @@ class WebhooksRetries(TestCase):
 
         webhook_e1_compare = WebhookEvent.objects.filter(pk=webhook_e1.id)
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                500, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(500, stream=ContentFile("OK")),
         ):
             # Time to retry
             next_retry_date = fake_now + timedelta(minutes=3)
@@ -7003,10 +6977,8 @@ class RecapFetchWebhooksTest(TestCase):
         self.assertEqual(dockets.count(), 1)
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             result = do_pacer_fetch(fq)
 
@@ -7085,10 +7057,8 @@ class RecapFetchWebhooksTest(TestCase):
         )
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             result = do_pacer_fetch(fq)
 
@@ -7124,10 +7094,10 @@ class RecapFetchWebhooksTest(TestCase):
 
     @mock.patch(
         "cl.recap.tasks.download_pacer_pdf_by_rd",
-        side_effect=lambda z, x, c, v, b, de_seq_num: (
-            MockResponse(
+        return_value=(
+            httpx.Response(
                 200,
-                mock_bucket_open(
+                content=mock_bucket_open(
                     "gov.uscourts.ca8.17-2543.00803263743.0.pdf", "rb", True
                 ),
             ),
@@ -7146,10 +7116,8 @@ class RecapFetchWebhooksTest(TestCase):
         )
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             result = do_pacer_fetch(fq)
 
@@ -8060,8 +8028,8 @@ class RemoveDuplicatedMinuteEntries(TestCase):
         )
 
     @mock.patch(
-        "cl.api.webhooks.requests.post",
-        side_effect=lambda *args, **kwargs: MockResponse(200, mock_raw=True),
+        "cl.api.webhooks.httpx.AsyncClient.post",
+        return_value=httpx.Response(200, stream=ContentFile("OK")),
     )
     def test_avoid_deleting_non_duplicated_minute_entries(
         self,
@@ -8131,8 +8099,8 @@ class RemoveDuplicatedMinuteEntries(TestCase):
             )
 
     @mock.patch(
-        "cl.api.webhooks.requests.post",
-        side_effect=lambda *args, **kwargs: MockResponse(200, mock_raw=True),
+        "cl.api.webhooks.httpx.AsyncClient.post",
+        return_value=httpx.Response(200, stream=ContentFile("OK")),
     )
     def test_remove_duplicated_minute_entries(
         self,

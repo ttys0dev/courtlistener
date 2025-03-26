@@ -118,7 +118,9 @@ class Command(cl_scrape_opinions.Command):
         court: Court,
         backscrape: bool = False,
     ):
-        content = get_binary_content(item["download_urls"], site)
+        content = async_to_sync(get_binary_content)(
+            item["download_urls"], site
+        )
         # request.content is sometimes a str, sometimes unicode, so
         # force it all to be bytes, pleasing hashlib.
         sha1_hash = sha1(force_bytes(content))

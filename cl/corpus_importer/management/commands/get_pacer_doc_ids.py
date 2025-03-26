@@ -12,7 +12,7 @@ PACER_USERNAME = os.environ.get("PACER_USERNAME", settings.PACER_USERNAME)
 PACER_PASSWORD = os.environ.get("PACER_PASSWORD", settings.PACER_PASSWORD)
 
 
-def get_pacer_doc_ids(options):
+async def get_pacer_doc_ids(options):
     """Get pacer_doc_ids for any item that needs them."""
     q = options["queue"]
     throttle = CeleryThrottle(queue_name=q)
@@ -41,7 +41,7 @@ def get_pacer_doc_ids(options):
             logger.info(
                 f"Sent {completed} tasks to celery so far. Latest pk: {row_pk}"
             )
-        get_pacer_doc_id_with_show_case_doc_url.apply_async(
+        await get_pacer_doc_id_with_show_case_doc_url(
             args=(row_pk, session.cookies), queue=q
         )
         completed += 1

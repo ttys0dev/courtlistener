@@ -7,12 +7,14 @@ from unittest import mock
 from unittest.mock import MagicMock, patch
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 from asgiref.sync import async_to_sync, sync_to_async
 from django.contrib.auth.hashers import make_password
 from django.contrib.auth.models import Permission
 from django.contrib.contenttypes.models import ContentType
 from django.contrib.humanize.templatetags.humanize import intcomma, ordinal
 from django.contrib.sites.models import Site
+from django.core.files.base import ContentFile
 from django.core.management import call_command
 from django.db import connection
 from django.http import HttpRequest, JsonResponse
@@ -2947,16 +2949,16 @@ class WebhooksProxySecurityTest(TestCase):
             enabled=True,
         )
 
-    def test_avoid_sending_webhooks_to_internal_ips(self):
+    async def test_avoid_sending_webhooks_to_internal_ips(self):
         """Can we avoid sending webhooks to internal IPs?"""
 
-        webhook_event = WebhookEventFactory(
+        webhook_event = await sync_to_async(WebhookEventFactory)(
             webhook=self.webhook_https,
             content="{'message': 'ok_1'}",
             event_status=WEBHOOK_EVENT_STATUS.IN_PROGRESS,
         )
-        send_webhook_event(webhook_event)
-        webhook_event.refresh_from_db()
+        await send_webhook_event(webhook_event)
+        await webhook_event.arefresh_from_db()
         self.assertNotEqual(
             webhook_event.response,
             "",
@@ -2968,13 +2970,13 @@ class WebhooksProxySecurityTest(TestCase):
             HTTPStatus.FORBIDDEN,
         )
 
-        webhook_event_2 = WebhookEventFactory(
+        webhook_event_2 = await sync_to_async(WebhookEventFactory)(
             webhook=self.webhook_http,
             content="{'message': 'ok_1'}",
             event_status=WEBHOOK_EVENT_STATUS.IN_PROGRESS,
         )
-        send_webhook_event(webhook_event_2)
-        webhook_event_2.refresh_from_db()
+        await send_webhook_event(webhook_event_2)
+        await webhook_event_2.arefresh_from_db()
         self.assertNotEqual(
             webhook_event.response,
             "",
@@ -2986,13 +2988,13 @@ class WebhooksProxySecurityTest(TestCase):
             HTTPStatus.FORBIDDEN,
         )
 
-        webhook_event_3 = WebhookEventFactory(
+        webhook_event_3 = await sync_to_async(WebhookEventFactory)(
             webhook=self.webhook_0_0_0_0,
             content="{'message': 'ok_1'}",
             event_status=WEBHOOK_EVENT_STATUS.IN_PROGRESS,
         )
-        send_webhook_event(webhook_event_3)
-        webhook_event_3.refresh_from_db()
+        await send_webhook_event(webhook_event_3)
+        await webhook_event_3.arefresh_from_db()
         self.assertNotEqual(
             webhook_event.response,
             "",
@@ -3052,12 +3054,10 @@ class WebhooksMilestoneEventsTest(TestCase):
         )
         # Send one webhook event for user_1.
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
-            await sync_to_async(send_webhook_event)(webhook_event_1)
+            await send_webhook_event(webhook_event_1)
 
         webhook_events = WebhookEvent.objects.all()
         self.assertEqual(await webhook_events.acount(), 1)
@@ -3092,12 +3092,10 @@ class WebhooksMilestoneEventsTest(TestCase):
                 event_status=WEBHOOK_EVENT_STATUS.IN_PROGRESS,
             )
             with mock.patch(
-                "cl.api.webhooks.requests.post",
-                side_effect=lambda *args, **kwargs: MockResponse(
-                    200, mock_raw=True
-                ),
+                "cl.api.webhooks.httpx.AsyncClient.post",
+                return_value=httpx.Response(200, stream=ContentFile("OK")),
             ):
-                await sync_to_async(send_webhook_event)(webhook_event)
+                await send_webhook_event(webhook_event)
 
         self.assertEqual(await webhook_events.acount(), 5)
 
@@ -3123,12 +3121,10 @@ class WebhooksMilestoneEventsTest(TestCase):
                 event_status=WEBHOOK_EVENT_STATUS.IN_PROGRESS,
             )
             with mock.patch(
-                "cl.api.webhooks.requests.post",
-                side_effect=lambda *args, **kwargs: MockResponse(
-                    200, mock_raw=True
-                ),
+                "cl.api.webhooks.httpx.AsyncClient.post",
+                return_value=httpx.Response(200, stream=ContentFile("OK")),
             ):
-                await sync_to_async(send_webhook_event)(webhook_event_2)
+                await send_webhook_event(webhook_event_2)
 
         user_2_events = Event.objects.filter(
             user=self.webhook_user_2.user
@@ -3163,12 +3159,10 @@ class WebhooksMilestoneEventsTest(TestCase):
         )
         # Send a webhook event that fails to be delivered.
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                500, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(500, stream=ContentFile("OK")),
         ):
-            await sync_to_async(send_webhook_event)(webhook_event_1)
+            await send_webhook_event(webhook_event_1)
 
         webhook_events = WebhookEvent.objects.all()
         await webhook_event_1.arefresh_from_db()
@@ -3188,12 +3182,10 @@ class WebhooksMilestoneEventsTest(TestCase):
         )
         # Send a debug webhook event.
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
-            await sync_to_async(send_webhook_event)(webhook_event_2)
+            await send_webhook_event(webhook_event_2)
 
         await webhook_event_2.arefresh_from_db()
         self.assertEqual(

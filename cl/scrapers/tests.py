@@ -4,7 +4,8 @@ from http import HTTPStatus
 from pathlib import Path
 from unittest import TestCase, mock
 
-from asgiref.sync import async_to_sync
+import httpx
+from asgiref.sync import async_to_sync, sync_to_async
 from django.conf import settings
 from django.core.files.base import ContentFile
 from django.test.utils import override_settings
@@ -88,10 +89,10 @@ class ScraperIngestionTest(ESIndexTestCase, TestCase):
         )
         self.assertEqual(r.status_code, HTTPStatus.BAD_REQUEST)
 
-    def test_ingest_opinions_from_scraper(self) -> None:
+    async def test_ingest_opinions_from_scraper(self) -> None:
         """Can we successfully ingest opinions at a high level?"""
 
-        d_1 = DocketFactory(
+        d_1 = await sync_to_async(DocketFactory)(
             case_name="Tarrant Regional Water District v. Herrmann",
             docket_number="11-889",
             court=self.court,
@@ -99,7 +100,7 @@ class ScraperIngestionTest(ESIndexTestCase, TestCase):
             pacer_case_id=None,
         )
 
-        d_2 = DocketFactory(
+        d_2 = await sync_to_async(DocketFactory)(
             case_name="State of Indiana v. Charles Barker",
             docket_number="49S00-0308-DP-392",
             court=self.court,
@@ -107,7 +108,7 @@ class ScraperIngestionTest(ESIndexTestCase, TestCase):
             pacer_case_id=None,
         )
 
-        d_3 = DocketFactory(
+        d_3 = await sync_to_async(DocketFactory)(
             case_name="Intl Fidlty Ins Co v. Ideal Elec Sec Co",
             docket_number="96-7169",
             court=self.court,
@@ -117,27 +118,27 @@ class ScraperIngestionTest(ESIndexTestCase, TestCase):
 
         site = test_opinion_scraper.Site()
         site.method = "LOCAL"
-        parsed_site = site.parse()
-        cl_scrape_opinions.Command().scrape_court(
+        parsed_site = await site.parse()
+        await sync_to_async(cl_scrape_opinions.Command().scrape_court)(
             parsed_site, full_crawl=True, ocr_available=False
         )
 
         opinions = Opinion.objects.all()
-        count = opinions.count()
+        count = await opinions.acount()
         self.assertTrue(
-            opinions.count() == 6,
+            await opinions.acount() == 6,
             f"Should have 6 test opinions, not {count}",
         )
 
         dockets = Docket.objects.all()
         self.assertTrue(
-            dockets.count() == 6,
-            f"Should have 6 test dockets, not {dockets.count()}",
+            await dockets.acount() == 6,
+            f"Should have 6 test dockets, not {await dockets.acount()}",
         )
 
-        d_1.refresh_from_db()
-        d_2.refresh_from_db()
-        d_3.refresh_from_db()
+        await d_1.arefresh_from_db()
+        await d_2.arefresh_from_db()
+        await d_3.arefresh_from_db()
         self.assertEqual(d_1.source, Docket.RECAP_AND_SCRAPER)
         self.assertEqual(d_2.source, Docket.SCRAPER_AND_IDB)
         self.assertEqual(d_3.source, Docket.RECAP_AND_SCRAPER_AND_IDB)
@@ -223,10 +224,10 @@ class ScraperIngestionTest(ESIndexTestCase, TestCase):
                         )
 
     @override_settings(PERCOLATOR_RECAP_SEARCH_ALERTS_ENABLED=True)
-    def test_ingest_oral_arguments(self) -> None:
+    async def test_ingest_oral_arguments(self) -> None:
         """Can we successfully ingest oral arguments at a high level?"""
 
-        d_1 = DocketFactory(
+        d_1 = await sync_to_async(DocketFactory)(
             case_name="Jeremy v. Julian",
             docket_number="23-232388",
             court=self.court,
@@ -236,22 +237,22 @@ class ScraperIngestionTest(ESIndexTestCase, TestCase):
 
         site = test_oral_arg_scraper.Site()
         site.method = "LOCAL"
-        parsed_site = site.parse()
+        parsed_site = await site.parse()
         with self.captureOnCommitCallbacks(execute=True):
-            cl_scrape_oral_arguments.Command().scrape_court(
-                parsed_site, full_crawl=True
-            )
+            await sync_to_async(
+                cl_scrape_oral_arguments.Command().scrape_court
+            )(parsed_site, full_crawl=True)
 
         # There should now be two items in the database.
         audio_files = Audio.objects.all()
-        self.assertEqual(2, audio_files.count())
+        self.assertEqual(2, await audio_files.acount())
 
         dockets = Docket.objects.all()
         self.assertTrue(
-            dockets.count() == 2,
-            f"Should have 2 dockets, not {dockets.count()}",
+            await dockets.acount() == 2,
+            f"Should have 2 dockets, not {await dockets.acount()}",
         )
-        d_1.refresh_from_db()
+        await d_1.arefresh_from_db()
         self.assertEqual(d_1.source, Docket.RECAP_AND_SCRAPER)
 
         # Confirm that OA Search Alerts are properly triggered after an OA is
@@ -263,7 +264,7 @@ class ScraperIngestionTest(ESIndexTestCase, TestCase):
         )
 
         cases_names = ["Jeremy v. Julian", "Ander v. Leo"]
-        for webhook_sent in webhook_events:
+        async for webhook_sent in webhook_events:
             self.assertEqual(
                 webhook_sent.webhook.user,
                 self.user_profile.user,
@@ -282,14 +283,14 @@ class ScraperIngestionTest(ESIndexTestCase, TestCase):
                 content["payload"]["results"][0]["local_path"]
             )
 
-    def test_parsing_xml_opinion_site_to_site_object(self) -> None:
+    async def test_parsing_xml_opinion_site_to_site_object(self) -> None:
         """Does a basic parse of a site reveal the right number of items?"""
-        site = test_opinion_scraper.Site().parse()
+        site = await test_opinion_scraper.Site().parse()
         self.assertEqual(len(site.case_names), 6)
 
-    def test_parsing_xml_oral_arg_site_to_site_object(self) -> None:
+    async def test_parsing_xml_oral_arg_site_to_site_object(self) -> None:
         """Does a basic parse of an oral arg site work?"""
-        site = test_oral_arg_scraper.Site().parse()
+        site = await test_oral_arg_scraper.Site().parse()
         self.assertEqual(len(site.case_names), 2)
 
 
@@ -636,49 +637,45 @@ class AudioFileTaskTest(TestCase):
 class ScraperContentTypeTest(TestCase):
     def setUp(self):
         # Common mock setup for all tests
-        self.mock_response = mock.MagicMock()
+        self.mock_response = mock.AsyncMock(httpx.Response)
         self.mock_response.content = b"not empty"
         self.mock_response.headers = {"Content-Type": "application/pdf"}
         self.site = test_opinion_scraper.Site()
         self.site.method = "GET"
         self.logger = logger
 
-    @mock.patch("requests.Session.get")
-    def test_unexpected_content_type(self, mock_get):
+    @mock.patch("httpx.AsyncClient.get")
+    async def test_unexpected_content_type(self, mock_get):
         """Test when content type doesn't match scraper expectation."""
         mock_get.return_value = self.mock_response
         self.site.expected_content_types = ["text/html"]
-        self.assertRaises(
-            UnexpectedContentTypeError,
-            get_binary_content,
-            "/dummy/url/",
-            self.site,
-        )
+        with self.assertRaises(UnexpectedContentTypeError):
+            await get_binary_content("/dummy/url/", self.site)
 
-    @mock.patch("requests.Session.get")
-    def test_correct_content_type(self, mock_get):
+    @mock.patch("httpx.AsyncClient.get")
+    async def test_correct_content_type(self, mock_get):
         """Test when content type matches scraper expectation."""
         mock_get.return_value = self.mock_response
         self.site.expected_content_types = ["application/pdf"]
 
         with mock.patch.object(self.logger, "error") as error_mock:
-            _ = get_binary_content("/dummy/url/", self.site)
+            _ = await get_binary_content("/dummy/url/", self.site)
 
             self.mock_response.headers = {
                 "Content-Type": "application/pdf;charset=utf-8"
             }
             mock_get.return_value = self.mock_response
-            _ = get_binary_content("/dummy/url/", self.site)
+            _ = await get_binary_content("/dummy/url/", self.site)
             error_mock.assert_not_called()
 
-    @mock.patch("requests.Session.get")
-    def test_no_content_type(self, mock_get):
+    @mock.patch("httpx.AsyncClient.get")
+    async def test_no_content_type(self, mock_get):
         """Test for no content type expected (ie. Montana)"""
         mock_get.return_value = self.mock_response
         self.site.expected_content_types = None
 
         with mock.patch.object(self.logger, "error") as error_mock:
-            _ = get_binary_content("/dummy/url/", self.site)
+            _ = await get_binary_content("/dummy/url/", self.site)
             error_mock.assert_not_called()
 
 

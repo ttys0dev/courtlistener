@@ -2,6 +2,7 @@ import sys
 import time
 from datetime import timedelta
 
+from asgiref.sync import async_to_sync
 from django.db import transaction
 from django.utils.timezone import now
 
@@ -56,7 +57,7 @@ def retry_webhook_events() -> int:
             date_created__gte=created_date_cut_off,
         ).order_by("date_created")
         for webhook_event in webhook_events_to_retry:
-            send_webhook_event(webhook_event)
+            async_to_sync(send_webhook_event)(webhook_event)
     return len(webhook_events_to_retry)
 
 

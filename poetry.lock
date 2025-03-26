@@ -2468,10 +2468,8 @@ description = "An API to scrape American court websites for metadata."
 optional = false
 python-versions = "*"
 groups = ["main"]
-files = [
-    {file = "juriscraper-2.6.63-py27-none-any.whl", hash = "sha256:a98f6a58e52470a27d4f6b1c9f84f7b0d3a78569e4361994b209b80e339cd0bf"},
-    {file = "juriscraper-2.6.63.tar.gz", hash = "sha256:ac90ec0ec75b97db65378c7d91643d15ebb4c45c33ffa2fcf968bdee36262ae8"},
-]
+files = []
+develop = false
 
 [package.dependencies]
 argparse = "*"
@@ -2483,16 +2481,22 @@ dateparser = ">=1.2.0"
 feedparser = ">=6.0.11"
 geonamescache = ">=2.0.0"
 html5lib = "*"
+httpx = {version = ">=0.28.1", extras = ["http2"]}
 lxml = ">=5.2"
 nh3 = "*"
 python-dateutil = ">=2.8.2"
-requests = ">=2.20.0"
 selenium = ">=4.9.1"
 tldextract = "*"
 
 [package.extras]
 dev = ["pytest"]
 test = ["jsondate3-aware", "pytest"]
+
+[package.source]
+type = "git"
+url = "https://github.com/ttys0dev/juriscraper.git"
+reference = "f3708eae4afb3dc269bb2edc73a0930b4e9dd653"
+resolved_reference = "f3708eae4afb3dc269bb2edc73a0930b4e9dd653"
 
 [[package]]
 name = "kdtree"
@@ -5988,4 +5992,4 @@ testing = ["coverage[toml]", "zope.event", "zope.testing"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.13, <3.14"
-content-hash = "5bb450ac96a3282f21c61fc82b4e0cfea0404960ffe94c44a1fd4ea299693bdd"
+content-hash = "04ce3994c9f8ec6287b7bfc9641bcceec404954bc31206520aa96b87482f52e5"

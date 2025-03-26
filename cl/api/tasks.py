@@ -1,6 +1,7 @@
 import json
 from typing import Any
 
+from asgiref.sync import async_to_sync
 from elasticsearch_dsl.response import Hit
 from rest_framework.renderers import JSONRenderer
 
@@ -38,7 +39,9 @@ def send_test_webhook_event(
     webhook_event = WebhookEvent.objects.create(
         webhook=webhook, content=json_obj, debug=True
     )
-    send_webhook_event(webhook_event, content_str.encode("utf-8"))
+    async_to_sync(send_webhook_event)(
+        webhook_event, content_str.encode("utf-8")
+    )
 
 
 @app.task()
@@ -80,7 +83,7 @@ def send_docket_alert_webhook_events(
             webhook=webhook,
             content=post_content,
         )
-        send_webhook_event(webhook_event, json_bytes)
+        async_to_sync(send_webhook_event)(webhook_event, json_bytes)
 
 
 # TODO: Remove after scheduled OA alerts have been processed.
@@ -122,7 +125,7 @@ def send_es_search_alert_webhook(
         webhook=webhook,
         content=post_content,
     )
-    send_webhook_event(webhook_event, json_bytes)
+    async_to_sync(send_webhook_event)(webhook_event, json_bytes)
 
 
 @app.task()
@@ -176,4 +179,4 @@ def send_search_alert_webhook_es(
         webhook=webhook,
         content=post_content,
     )
-    send_webhook_event(webhook_event, json_bytes)
+    async_to_sync(send_webhook_event)(webhook_event, json_bytes)

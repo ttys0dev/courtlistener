@@ -5,8 +5,8 @@ from typing import Optional, Tuple
 from urllib.parse import urljoin
 
 import httpx
-import requests
 from asgiref.sync import async_to_sync
+from charset_normalizer import from_bytes
 from courts_db import find_court_by_id, find_court_ids_by_name
 from django.conf import settings
 from django.core.files.base import ContentFile
@@ -15,10 +15,8 @@ from eyecite.find import get_citations
 from eyecite.tokenizers import HyperscanTokenizer
 from juriscraper import AbstractSite
 from juriscraper.AbstractSite import logger
-from juriscraper.lib.test_utils import MockRequest
 from lxml import html
 from reporters_db import REPORTERS
-from requests import Response, Session
 
 from cl.citations.utils import map_reporter_db_cite_type
 from cl.corpus_importer.utils import winnow_case_name
@@ -160,27 +158,20 @@ def get_child_court(child_court_name: str, court_id: str) -> Optional[Court]:
     return child_court
 
 
-@retry(
-    (
-        httpx.NetworkError,
-        httpx.TimeoutException,
-    ),
-    tries=3,
-    delay=5,
-    backoff=2,
-    logger=logger,
-)
-def test_for_meta_redirections(r: Response) -> Tuple[bool, Optional[str]]:
+async def test_for_meta_redirections(
+    r: httpx.Response,
+) -> Tuple[bool, Optional[str]]:
     """Test for meta data redirections
 
     :param r: A response object
     :return:  A boolean and value
     """
-    extension = async_to_sync(microservice)(
+    r = await microservice(
         service="buffer-extension",
         file=r.content,
         params={"mime": True},
-    ).text
+    )
+    extension = r.text
 
     if extension == ".html":
         html_tree = html.fromstring(r.text)
@@ -202,15 +193,17 @@ def test_for_meta_redirections(r: Response) -> Tuple[bool, Optional[str]]:
     return False, None
 
 
-def follow_redirections(r: Response, s: Session) -> Response:
+async def follow_redirections(
+    r: httpx.Response, s: httpx.AsyncClient
+) -> httpx.Response:
     """
     Parse and recursively follow meta refresh redirections if they exist until
     there are no more.
     """
-    redirected, url = test_for_meta_redirections(r)
+    redirected, url = await test_for_meta_redirections(r)
     if redirected:
         logger.info(f"Following a meta redirection to: {url.encode()}")
-        r = follow_redirections(s.get(url), s)
+        r = await follow_redirections(await s.get(url), s)
     return r
 
 
@@ -232,7 +225,7 @@ def get_extension(content: bytes) -> str:
     ).text
 
 
-def get_binary_content(
+async def get_binary_content(
     download_url: str,
     site: AbstractSite,
 ) -> bytes | str:
@@ -252,15 +245,43 @@ def get_binary_content(
     if site.method == "LOCAL":
         # "LOCAL" is the method when testing
         url = os.path.join(settings.MEDIA_ROOT, download_url)
-        mr = MockRequest(url=url)
-        r = mr.get()
-        s = requests.Session()
+        mock_url = f"https://{download_url}"
+
+        def handler(request: httpx.Request):
+            try:
+                with open(url, mode="rb") as stream:
+                    content = stream.read()
+                    try:
+                        text = content.decode("utf-8")
+                    except:
+                        text = str(from_bytes(content).best())
+                    r = httpx.Response(
+                        status_code=200,
+                        request=request,
+                        text=text,
+                    )
+                    if url.endswith("json"):
+                        r.headers["content-type"] = "application/json"
+                    r.request.url = mock_url
+            except OSError as e:
+                raise httpx.RequestError(str(e))
+            return r
+
+        transport = httpx.MockTransport(handler)
+        s = httpx.AsyncClient(transport=transport)
+        r = await s.get(url=mock_url)
     else:
         # some sites require a custom ssl_context, contained in the Site's
         # session. However, we can't send a request with both a
         # custom ssl_context and `verify = False`
         has_cipher = hasattr(site, "cipher")
-        s = site.request["session"] if has_cipher else requests.session()
+        s = (
+            site.request["session"]
+            if has_cipher
+            else httpx.AsyncClient(
+                verify=has_cipher  # WA has a certificate we don't understand
+            )
+        )
 
         if site.needs_special_headers:
             headers = site.request["headers"]
@@ -269,9 +290,8 @@ def get_binary_content(
 
         # Note that we do a GET even if site.method is POST. This is
         # deliberate.
-        r = s.get(
+        r = await s.get(
             download_url,
-            verify=has_cipher,  # WA has a certificate we don't understand
             headers=headers,
             cookies=site.cookies,
             timeout=300,
@@ -300,7 +320,7 @@ def get_binary_content(
                 raise UnexpectedContentTypeError(msg, fingerprint=fingerprint)
 
         # test for and follow meta redirects
-        r = follow_redirections(r, s)
+        r = await follow_redirections(r, s)
         r.raise_for_status()
 
     content = site.cleanup_content(r.content)

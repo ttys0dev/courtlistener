@@ -4,6 +4,7 @@ from http import HTTPStatus
 from unittest import mock
 from urllib.parse import parse_qs, urlencode, urlparse
 
+import httpx
 import pytz
 import time_machine
 from asgiref.sync import sync_to_async
@@ -11,6 +12,7 @@ from django.conf import settings
 from django.contrib.auth.hashers import make_password
 from django.contrib.auth.models import User
 from django.core import mail
+from django.core.files.base import ContentFile
 from django.core.mail import send_mail
 from django.core.management import call_command
 from django.test import AsyncClient, override_settings
@@ -306,8 +308,8 @@ class DocketAlertTest(TestCase):
         self.assertEqual(len(mail.outbox), 0)
 
     @mock.patch(
-        "cl.api.webhooks.requests.post",
-        side_effect=lambda *args, **kwargs: MockResponse(200, mock_raw=True),
+        "cl.api.webhooks.httpx.AsyncClient.post",
+        return_value=httpx.Response(200, stream=ContentFile("OK")),
     )
     def test_triggering_docket_webhook(self, mock_post) -> None:
         """Does the docket alert trigger the DocketAlert Webhook?"""
@@ -860,10 +862,8 @@ class SearchAlertsWebhooksTest(
                 new=[Audio],
             ),
             mock.patch(
-                "cl.api.webhooks.requests.post",
-                side_effect=lambda *args, **kwargs: MockResponse(
-                    200, mock_raw=True
-                ),
+                "cl.api.webhooks.httpx.AsyncClient.post",
+                return_value=httpx.Response(200, stream=ContentFile("OK")),
             ),
             time_machine.travel(cls.mock_date, tick=False),
             cls.captureOnCommitCallbacks(execute=True),
@@ -985,10 +985,8 @@ class SearchAlertsWebhooksTest(
         self.assertEqual(len(search_alerts), 9, msg="Alerts doesn't match.")
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), time_machine.travel(self.mock_date, tick=False):
             # Send Opinion Alerts
             call_command("cl_send_alerts", rate="dly")
@@ -1338,10 +1336,8 @@ class SearchAlertsWebhooksTest(
         ]
         for rate, events, results in rates:
             with mock.patch(
-                "cl.api.webhooks.requests.post",
-                side_effect=lambda *args, **kwargs: MockResponse(
-                    200, mock_raw=True
-                ),
+                "cl.api.webhooks.httpx.AsyncClient.post",
+                return_value=httpx.Response(200, stream=ContentFile("OK")),
             ):
                 # Monthly alerts cannot be run on the 29th, 30th or 31st.
                 with time_machine.travel(self.mock_date, tick=False):
@@ -2167,10 +2163,8 @@ class OldDocketAlertsWebhooksTest(TestCase):
 
         # Run handle_old_docket_alerts command, mocking webhook request.
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             call_command(
                 "handle_old_docket_alerts",
@@ -2256,10 +2250,8 @@ class OldDocketAlertsWebhooksTest(TestCase):
 
         # Run command again
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             call_command(
                 "handle_old_docket_alerts",
@@ -2287,10 +2279,8 @@ class OldDocketAlertsWebhooksTest(TestCase):
         # Run handle_old_docket_alerts command with delete_old_alerts=False,
         # mocking webhook request.
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             call_command(
                 "handle_old_docket_alerts",
@@ -2566,10 +2556,8 @@ class SearchAlertsOAESTests(ESIndexTestCase, TestCase, SearchAlertsAssertions):
         """Can we send RT OA search alerts?"""
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             mock_date = now().replace(day=1, hour=5)
             with time_machine.travel(
@@ -2701,10 +2689,8 @@ class SearchAlertsOAESTests(ESIndexTestCase, TestCase, SearchAlertsAssertions):
 
         # Confirm no HL fields are properly displayed.
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             mock_date = now().replace(day=1, hour=5)
             with time_machine.travel(
@@ -2758,10 +2744,8 @@ class SearchAlertsOAESTests(ESIndexTestCase, TestCase, SearchAlertsAssertions):
     def test_send_alert_on_document_creation(self, mock_abort_audio):
         """Avoid sending Search Alerts on document updates."""
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             # When the Audio object is created it should trigger an alert.
             rt_oral_argument = AudioWithParentsFactory.create(
@@ -2789,10 +2773,8 @@ class SearchAlertsOAESTests(ESIndexTestCase, TestCase, SearchAlertsAssertions):
         self.assertEqual(len(webhook_events), 4)
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             # Audio object is updated.
             rt_oral_argument.sha1 = "12345"
@@ -2865,10 +2847,8 @@ class SearchAlertsOAESTests(ESIndexTestCase, TestCase, SearchAlertsAssertions):
         previous_date=None,
     ):
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             with time_machine.travel(mock_date, tick=False):
                 # Call dly command
@@ -3010,10 +2990,8 @@ class SearchAlertsOAESTests(ESIndexTestCase, TestCase, SearchAlertsAssertions):
             )
         # Send mly alerts on a day after 28th, it must fail.
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             mock_date = now().replace(month=1, day=30, hour=0)
             with time_machine.travel(mock_date, tick=False):
@@ -3059,10 +3037,8 @@ class SearchAlertsOAESTests(ESIndexTestCase, TestCase, SearchAlertsAssertions):
             alert_type=SEARCH_TYPES.ORAL_ARGUMENT,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             # When the Audio object is created it should trigger an alert.
             rt_oral_argument_1 = AudioWithParentsFactory.create(
@@ -3163,10 +3139,8 @@ class SearchAlertsOAESTests(ESIndexTestCase, TestCase, SearchAlertsAssertions):
                 self.assertTrue(False, "Search Alert webhooks failed.")
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             # Call command dly
             call_command("cl_send_scheduled_alerts", rate="dly")
@@ -3287,10 +3261,8 @@ class SearchAlertsOAESTests(ESIndexTestCase, TestCase, SearchAlertsAssertions):
 
         # Trigger RT alerts adding a document that matches the alerts.
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             rt_oral_argument = AudioWithParentsFactory.create(
                 case_name="RT Test OA",
@@ -3356,10 +3328,8 @@ class SearchAlertsOAESTests(ESIndexTestCase, TestCase, SearchAlertsAssertions):
             # Create a new document that triggers each existing alert created
             # at this stage.
             with mock.patch(
-                "cl.api.webhooks.requests.post",
-                side_effect=lambda *args, **kwargs: MockResponse(
-                    200, mock_raw=True
-                ),
+                "cl.api.webhooks.httpx.AsyncClient.post",
+                return_value=httpx.Response(200, stream=ContentFile("OK")),
             ), self.captureOnCommitCallbacks(execute=True):
                 audio = AudioWithParentsFactory.create(
                     case_name="Test OA",
@@ -3396,10 +3366,8 @@ class SearchAlertsOAESTests(ESIndexTestCase, TestCase, SearchAlertsAssertions):
         self.assertEqual(len(webhook_events_rate[Alert.MONTHLY]), 10)
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             # Call dly command
             call_command("cl_send_scheduled_alerts", rate="dly")
@@ -3433,10 +3401,8 @@ class SearchAlertsOAESTests(ESIndexTestCase, TestCase, SearchAlertsAssertions):
 
         # Save a document to percolate it later.
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             rt_oral_argument = AudioWithParentsFactory.create(
                 case_name="Lorem Ipsum",
@@ -3496,10 +3462,8 @@ class SearchAlertsOAESTests(ESIndexTestCase, TestCase, SearchAlertsAssertions):
             alert_type=SEARCH_TYPES.ORAL_ARGUMENT,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             # When the Audio object is created it should trigger an alert.
             oral_argument = AudioWithParentsFactory.create(
@@ -3535,10 +3499,8 @@ class SearchAlertsOAESTests(ESIndexTestCase, TestCase, SearchAlertsAssertions):
             alert_type=SEARCH_TYPES.ORAL_ARGUMENT,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             # When the Audio object is created it should trigger an alert.
             oral_argument = AudioWithParentsFactory.create(
@@ -3631,10 +3593,8 @@ class SearchAlertsOAESTests(ESIndexTestCase, TestCase, SearchAlertsAssertions):
             alert_type=SEARCH_TYPES.ORAL_ARGUMENT,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             # Schedule the MONTHLY Alert hit.
             oral_argument_3 = AudioWithParentsFactory.create(

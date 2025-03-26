@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest import mock
 from unittest.mock import MagicMock, patch
 
+import httpx
 import time_machine
 from asgiref.sync import sync_to_async
 from django.conf import settings
@@ -13,6 +14,7 @@ from django.contrib.auth.hashers import make_password
 from django.contrib.auth.models import User
 from django.contrib.auth.tokens import default_token_generator
 from django.core import mail
+from django.core.files.base import ContentFile
 from django.core.mail import (
     EmailMessage,
     EmailMultiAlternatives,
@@ -3402,10 +3404,8 @@ class WebhooksHTMXTests(APITestCase):
             kwargs={"pk": webhooks_first.pk, "format": "json"},
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockPostResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             response = await self.client.post(webhook_1_path_test, {})
         # Compare the test webhook event data.
@@ -3420,10 +3420,8 @@ class WebhooksHTMXTests(APITestCase):
         )
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockPostResponse(
-                500, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(500, stream=ContentFile("OK")),
         ):
             response = await self.client.post(webhook_1_path_test, {})
         # Compare the test webhook event data.

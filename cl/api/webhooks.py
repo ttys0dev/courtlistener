@@ -1,8 +1,10 @@
 import json
 import random
 
-import requests
+import httpx
+from asgiref.sync import async_to_sync
 from django.conf import settings
+from django.contrib.auth.models import User
 from elasticsearch_dsl.response import Response
 from rest_framework.renderers import JSONRenderer
 
@@ -31,7 +33,7 @@ from cl.search.api_serializers import (
 )
 
 
-def send_webhook_event(
+async def send_webhook_event(
     webhook_event: WebhookEvent, content_bytes: bytes | None = None
 ) -> None:
     """Send the webhook POST request.
@@ -40,9 +42,7 @@ def send_webhook_event(
     :param content_bytes: Optional, the bytes JSON content to send the first time
     the webhook is sent.
     """
-    proxy_server = {
-        "http": random.choice(settings.EGRESS_PROXY_HOSTS),  # type: ignore
-    }
+    proxy_server = httpx.Proxy(url=random.choice(settings.EGRESS_PROXY_HOSTS))  # type: ignore[misc]
     headers = {
         "Content-type": "application/json",
         "Idempotency-Key": str(webhook_event.event_id),
@@ -64,23 +64,29 @@ def send_webhook_event(
         # To send a POST to an HTTPS target and using webhook-sentry as proxy,
         # you needed to change the protocol to HTTP and set the X-WhSentry-TLS
         # header to true. See https://github.com/juggernaut/webhook-sentry#https-target
-        url = webhook_event.webhook.url.replace("https://", "http://")
-        response = requests.post(
-            url,
-            proxies=proxy_server,
-            json=json_data,
-            timeout=(3, 3),
-            headers=headers,
-            allow_redirects=False,
-        )
-        update_webhook_event_after_request(webhook_event, response)
-    except (requests.ConnectionError, requests.Timeout) as exc:
+        webhook = await Webhook.objects.aget(pk=webhook_event.webhook_id)
+        url = webhook.url.replace("https://", "http://")
+        async with httpx.AsyncClient(proxy=proxy_server) as client:
+            async with client.stream(
+                "POST",
+                url,
+                json=json_data,
+                timeout=(3, 3),
+                headers=headers,
+                follow_redirects=False,
+            ) as response:
+                await update_webhook_event_after_request(
+                    webhook_event, response
+                )
+    except (httpx.NetworkError, httpx.TimeoutException) as exc:
         error_str = f"{type(exc).__name__}: {exc}"
         trunc(error_str, 500)
-        update_webhook_event_after_request(webhook_event, error=error_str)
+        await update_webhook_event_after_request(
+            webhook_event, error=error_str
+        )
 
 
-def send_old_alerts_webhook_event(
+async def send_old_alerts_webhook_event(
     webhook: Webhook, report: OldAlertReport
 ) -> None:
     """Send webhook event for old alerts
@@ -115,14 +121,14 @@ def send_old_alerts_webhook_event(
         post_content,
         accepted_media_type="application/json;",
     )
-    webhook_event = WebhookEvent.objects.create(
+    webhook_event = await WebhookEvent.objects.acreate(
         webhook=webhook,
         content=post_content,
     )
-    send_webhook_event(webhook_event, json_bytes)
+    await send_webhook_event(webhook_event, json_bytes)
 
 
-def send_recap_fetch_webhooks(fq: PacerFetchQueue) -> None:
+async def send_recap_fetch_webhooks(fq: PacerFetchQueue) -> None:
     """Send webhook event for processed PacerFetchQueue objects.
 
     :param fq: The PacerFetchQueue object related to the event.
@@ -137,10 +143,11 @@ def send_recap_fetch_webhooks(fq: PacerFetchQueue) -> None:
         PROCESSING_STATUS.INVALID_CONTENT,
         PROCESSING_STATUS.NEEDS_INFO,
     ]:
-        user_webhooks = fq.user.webhooks.filter(
+        user = await User.objects.aget(pk=fq.user_id)
+        user_webhooks = user.webhooks.filter(
             event_type=WebhookEventType.RECAP_FETCH, enabled=True
         )
-        for webhook in user_webhooks:
+        async for webhook in user_webhooks:
             payload = PacerFetchQueueSerializer(fq).data
             post_content = {
                 "webhook": generate_webhook_key_content(webhook),
@@ -151,11 +158,11 @@ def send_recap_fetch_webhooks(fq: PacerFetchQueue) -> None:
                 post_content,
                 accepted_media_type="application/json;",
             )
-            webhook_event = WebhookEvent.objects.create(
+            webhook_event = await WebhookEvent.objects.acreate(
                 webhook=webhook,
                 content=post_content,
             )
-            send_webhook_event(webhook_event, json_bytes)
+            await send_webhook_event(webhook_event, json_bytes)
 
 
 def send_search_alert_webhook(
@@ -201,4 +208,4 @@ def send_search_alert_webhook(
         webhook=webhook,
         content=post_content,
     )
-    send_webhook_event(webhook_event, json_bytes)
+    async_to_sync(send_webhook_event)(webhook_event, json_bytes)

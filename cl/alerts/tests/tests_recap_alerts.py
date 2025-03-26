@@ -1,9 +1,11 @@
 import datetime
 from unittest import mock
 
+import httpx
 import time_machine
 from django.conf import settings
 from django.core import mail
+from django.core.files.base import ContentFile
 from django.core.management import call_command
 from django.test.utils import override_settings
 from django.urls import reverse
@@ -131,10 +133,8 @@ class RECAPAlertsSweepIndexTest(
         )
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             call_command("cl_send_recap_alerts", testing_mode=True)
 
@@ -391,10 +391,8 @@ class RECAPAlertsSweepIndexTest(
             alert_type=SEARCH_TYPES.RECAP,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), time_machine.travel(self.mock_date, tick=False):
             call_command("cl_send_recap_alerts", testing_mode=True)
 
@@ -464,10 +462,8 @@ class RECAPAlertsSweepIndexTest(
             )
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), time_machine.travel(self.mock_date, tick=False):
             call_command("cl_send_recap_alerts", testing_mode=True)
         # The RD ingestion's shouldn't match the docket-only alert.
@@ -484,10 +480,8 @@ class RECAPAlertsSweepIndexTest(
             alert_type=SEARCH_TYPES.RECAP,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), time_machine.travel(self.mock_date, tick=False):
             call_command("cl_send_recap_alerts", testing_mode=True)
         # 1 New alert should be triggered.
@@ -518,10 +512,8 @@ class RECAPAlertsSweepIndexTest(
         # Trigger the same alert again to confirm that no new alert is
         # triggered because previous hits have already triggered the same alert
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), time_machine.travel(self.mock_date, tick=False):
             call_command("cl_send_recap_alerts", testing_mode=True)
         # No new alert should be triggered.
@@ -545,10 +537,8 @@ class RECAPAlertsSweepIndexTest(
             )
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), time_machine.travel(self.mock_date, tick=False):
             call_command("cl_send_recap_alerts", testing_mode=True)
 
@@ -575,10 +565,8 @@ class RECAPAlertsSweepIndexTest(
             alert_type=SEARCH_TYPES.RECAP,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), time_machine.travel(self.mock_date, tick=False):
             call_command("cl_send_recap_alerts", testing_mode=True)
 
@@ -610,10 +598,8 @@ class RECAPAlertsSweepIndexTest(
             alert_type=SEARCH_TYPES.RECAP,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), time_machine.travel(self.mock_date, tick=False):
             call_command("cl_send_recap_alerts", testing_mode=True)
 
@@ -667,10 +653,8 @@ class RECAPAlertsSweepIndexTest(
             alert_type=SEARCH_TYPES.RECAP,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), time_machine.travel(self.mock_date, tick=False):
             call_command("cl_send_recap_alerts", testing_mode=True)
 
@@ -714,10 +698,8 @@ class RECAPAlertsSweepIndexTest(
             alert_type=SEARCH_TYPES.RECAP,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), time_machine.travel(self.mock_date, tick=False):
             call_command("cl_send_recap_alerts", testing_mode=True)
 
@@ -773,10 +755,8 @@ class RECAPAlertsSweepIndexTest(
             )
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), time_machine.travel(self.mock_date, tick=False):
             call_command("cl_send_recap_alerts", testing_mode=True)
 
@@ -813,10 +793,8 @@ class RECAPAlertsSweepIndexTest(
             )
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), time_machine.travel(self.mock_date, tick=False):
             call_command("cl_send_recap_alerts", testing_mode=True)
 
@@ -857,10 +835,8 @@ class RECAPAlertsSweepIndexTest(
 
         # Trigger the alert again:
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), time_machine.travel(self.mock_date, tick=False):
             call_command("cl_send_recap_alerts", testing_mode=True)
 
@@ -887,10 +863,8 @@ class RECAPAlertsSweepIndexTest(
 
         # Trigger alert again:
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), time_machine.travel(self.mock_date, tick=False):
             call_command("cl_send_recap_alerts", testing_mode=True)
         # No new alerts should be triggered.
@@ -931,10 +905,8 @@ class RECAPAlertsSweepIndexTest(
             alert_type=SEARCH_TYPES.RECAP,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), time_machine.travel(self.mock_date, tick=False):
             call_command("cl_send_recap_alerts", testing_mode=True)
 
@@ -989,10 +961,8 @@ class RECAPAlertsSweepIndexTest(
             alert_type=SEARCH_TYPES.RECAP,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), time_machine.travel(self.mock_date, tick=False):
             call_command("cl_send_recap_alerts", testing_mode=True)
 
@@ -1055,10 +1025,8 @@ class RECAPAlertsSweepIndexTest(
             alert_type=SEARCH_TYPES.RECAP,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             call_command("cl_send_recap_alerts", testing_mode=True)
 
@@ -1185,10 +1153,8 @@ class RECAPAlertsSweepIndexTest(
         )
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             call_command("cl_send_recap_alerts", testing_mode=True)
 
@@ -1374,10 +1340,8 @@ class RECAPAlertsSweepIndexTest(
             alert_type=SEARCH_TYPES.RECAP,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             call_command("cl_send_recap_alerts", testing_mode=True)
 
@@ -1559,10 +1523,8 @@ class RECAPAlertsSweepIndexTest(
             )
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             docket = DocketFactory(
                 court=self.court,
@@ -1649,10 +1611,8 @@ class RECAPAlertsSweepIndexTest(
 
         # Now update the docket case_name to match cross_object_alert_after_update
         with time_machine.travel(self.mock_date, tick=False), mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             docket.case_name = "SUBPOENAS SERVED CASE UPDATED"
             docket.save()
@@ -1668,10 +1628,8 @@ class RECAPAlertsSweepIndexTest(
 
         # The missing alert should be sent by the Sweep index alert approach.
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), time_machine.travel(self.mock_date, tick=False):
             call_command("cl_send_recap_alerts", testing_mode=True)
 
@@ -2284,10 +2242,8 @@ class RECAPAlertsPercolatorTest(
             alert_type=SEARCH_TYPES.RECAP,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             docket = DocketFactory(
                 court=self.court,
@@ -2321,10 +2277,8 @@ class RECAPAlertsPercolatorTest(
             alert_type=SEARCH_TYPES.RECAP,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             alert_de = DocketEntryWithParentsFactory(
                 docket=DocketFactory(
@@ -2375,10 +2329,8 @@ class RECAPAlertsPercolatorTest(
             alert_type=SEARCH_TYPES.RECAP,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             alert_de_2 = DocketEntryWithParentsFactory(
                 docket=DocketFactory(
@@ -2428,10 +2380,8 @@ class RECAPAlertsPercolatorTest(
             alert_type=SEARCH_TYPES.RECAP,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             alert_de_2.description = "Hearing to File Updated"
             alert_de_2.save()
@@ -2446,10 +2396,8 @@ class RECAPAlertsPercolatorTest(
         # Alert is triggered only after a RECAPDocument creation/update to avoid
         # percolating the same document twice.
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             rd_2.document_number = 1
             rd_2.save()
@@ -2482,10 +2430,8 @@ class RECAPAlertsPercolatorTest(
             alert_type=SEARCH_TYPES.RECAP,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             docket.case_name = "SUBPOENAS SERVED LOREM"
             docket.save()
@@ -2516,10 +2462,8 @@ class RECAPAlertsPercolatorTest(
             alert_type=SEARCH_TYPES.RECAP,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             BankruptcyInformationFactory(docket=docket, chapter="7")
 
@@ -2557,15 +2501,8 @@ class RECAPAlertsPercolatorTest(
             docket=docket,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
-        ), mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ):
             index_docket_parties_in_es.delay(docket.pk)
 
@@ -2589,10 +2526,8 @@ class RECAPAlertsPercolatorTest(
             alert_type=SEARCH_TYPES.RECAP,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             docket = DocketFactory(
                 court=self.court,
@@ -2620,10 +2555,8 @@ class RECAPAlertsPercolatorTest(
             alert_type=SEARCH_TYPES.RECAP,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             alert_de = DocketEntryWithParentsFactory(
                 docket=DocketFactory(
@@ -2663,10 +2596,8 @@ class RECAPAlertsPercolatorTest(
         """Test group Percolator RECAP Alerts in an email and hits."""
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             docket = DocketFactory(
                 court=self.court,
@@ -2969,10 +2900,8 @@ class RECAPAlertsPercolatorTest(
             alert_type=SEARCH_TYPES.RECAP,
         )
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             docket = DocketFactory(
                 court=self.court,
@@ -3022,10 +2951,8 @@ class RECAPAlertsPercolatorTest(
         )
         # RD ingestion.
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             alert_de = DocketEntryWithParentsFactory(
                 docket=docket,
@@ -3109,10 +3036,8 @@ class RECAPAlertsPercolatorTest(
             alerts_created_user_2.append(docket_only_alert_2)
 
         with mock.patch(
-            "cl.api.webhooks.requests.post",
-            side_effect=lambda *args, **kwargs: MockResponse(
-                200, mock_raw=True
-            ),
+            "cl.api.webhooks.httpx.AsyncClient.post",
+            return_value=httpx.Response(200, stream=ContentFile("OK")),
         ), self.captureOnCommitCallbacks(execute=True):
             docket = DocketFactory(
                 court=self.court,

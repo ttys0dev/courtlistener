@@ -9,6 +9,7 @@ downloaded. If we find an Opinion we don't have in the database,
 we ingest it as in a regular scrape
 """
 
+from asgiref.sync import async_to_sync
 from django.db import IntegrityError
 from django.utils.encoding import force_bytes
 
@@ -61,7 +62,9 @@ class Command(cl_back_scrape_opinions.Command):
                 continue
 
             try:
-                content = get_binary_content(case["download_urls"], site)
+                content = async_to_sync(get_binary_content)(
+                    case["download_urls"], site
+                )
             except BadContentError:
                 continue
 
