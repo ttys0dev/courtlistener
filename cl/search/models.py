@@ -3672,7 +3672,7 @@ class Tag(AbstractDateTimeModel):
     def __str__(self) -> str:
         return f"{self.pk}: {self.name}"
 
-    def tag_object(self, thing: TaggableType) -> tuple["Tag", bool]:
+    def tag_object(self, thing: TaggableType) -> tuple[Tag, bool]:
         """Atomically add a tag to an item.
 
         Django has a system for adding to a m2m relationship like the ones
