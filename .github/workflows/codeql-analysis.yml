@@ -22,7 +22,7 @@ jobs:
     # `github/codeql-action/init`)
     - uses: actions/setup-python@v6
       with:
-        python-version: '3.13'
+        python-version: '3.14'
 
     # Initializes the CodeQL tools for scanning.
     - name: Initialize CodeQL
