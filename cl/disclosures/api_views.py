@@ -1,5 +1,5 @@
 from rest_framework import viewsets
-from rest_framework.permissions import DjangoModelPermissionsOrAnonReadOnly
+from rest_framework.permissions import DjangoModelPermissions
 
 from cl.api.api_permissions import V3APIPermission
 from cl.api.utils import (
@@ -42,13 +42,17 @@ from cl.disclosures.models import (
 )
 
 
+def disclosure_child_queryset(model):
+    return model.objects.select_related("financial_disclosure").order_by("-id")
+
+
 class AgreementViewSet(
     LoggingMixin, DeferredFieldsMixin, viewsets.ModelViewSet
 ):
-    queryset = Agreement.objects.all().order_by("-id")
+    queryset = disclosure_child_queryset(Agreement)
     serializer_class = AgreementSerializer
     permission_classes = [
-        DjangoModelPermissionsOrAnonReadOnly,
+        DjangoModelPermissions,
         V3APIPermission,
     ]
     ordering_fields = ("id", "date_created", "date_modified")
@@ -64,10 +68,10 @@ class AgreementViewSet(
 
 
 class DebtViewSet(LoggingMixin, DeferredFieldsMixin, viewsets.ModelViewSet):
-    queryset = Debt.objects.all().order_by("-id")
+    queryset = disclosure_child_queryset(Debt)
     serializer_class = DebtSerializer
     permission_classes = [
-        DjangoModelPermissionsOrAnonReadOnly,
+        DjangoModelPermissions,
         V3APIPermission,
     ]
     ordering_fields = ("id", "date_created", "date_modified")
@@ -86,7 +90,7 @@ class FinancialDisclosureViewSet(
     LoggingMixin, DeferredFieldsMixin, viewsets.ModelViewSet
 ):
     queryset = (
-        FinancialDisclosure.objects.all()
+        FinancialDisclosure.objects.select_related("person")
         .prefetch_related(
             "agreements",
             "debts",
@@ -96,14 +100,13 @@ class FinancialDisclosureViewSet(
             "positions",
             "reimbursements",
             "spouse_incomes",
-            "person",
         )
         .order_by("-id")
     )
     serializer_class = FinancialDisclosureSerializer
     filterset_class = FinancialDisclosureFilter
     permission_classes = [
-        DjangoModelPermissionsOrAnonReadOnly,
+        DjangoModelPermissions,
         V3APIPermission,
     ]
     ordering_fields = ("id", "date_created", "date_modified")
@@ -118,11 +121,11 @@ class FinancialDisclosureViewSet(
 
 
 class GiftViewSet(LoggingMixin, DeferredFieldsMixin, viewsets.ModelViewSet):
-    queryset = Gift.objects.all().order_by("-id")
+    queryset = disclosure_child_queryset(Gift)
     serializer_class = GiftSerializer
     filterset_class = GiftFilter
     permission_classes = [
-        DjangoModelPermissionsOrAnonReadOnly,
+        DjangoModelPermissions,
         V3APIPermission,
     ]
     ordering_fields = ("id", "date_created", "date_modified")
@@ -142,11 +145,11 @@ class InvestmentViewSet(
     DeferredFieldsMixin,
     viewsets.ModelViewSet,
 ):
-    queryset = Investment.objects.all().order_by("-id")
+    queryset = disclosure_child_queryset(Investment)
     serializer_class = InvestmentSerializer
     filterset_class = InvestmentFilter
     permission_classes = [
-        DjangoModelPermissionsOrAnonReadOnly,
+        DjangoModelPermissions,
         V3APIPermission,
     ]
     ordering_fields = ("id", "date_created", "date_modified")
@@ -163,11 +166,11 @@ class InvestmentViewSet(
 class NonInvestmentIncomeViewSet(
     LoggingMixin, DeferredFieldsMixin, viewsets.ModelViewSet
 ):
-    queryset = NonInvestmentIncome.objects.all().order_by("-id")
+    queryset = disclosure_child_queryset(NonInvestmentIncome)
     serializer_class = NonInvestmentIncomeSerializer
     filterset_class = NonInvestmentIncomeFilter
     permission_classes = [
-        DjangoModelPermissionsOrAnonReadOnly,
+        DjangoModelPermissions,
         V3APIPermission,
     ]
     ordering_fields = ("id", "date_created", "date_modified")
@@ -184,11 +187,11 @@ class NonInvestmentIncomeViewSet(
 class PositionViewSet(
     LoggingMixin, DeferredFieldsMixin, viewsets.ModelViewSet
 ):
-    queryset = Position.objects.all().order_by("-id")
+    queryset = disclosure_child_queryset(Position)
     serializer_class = PositionSerializer
     filterset_class = PositionFilter
     permission_classes = [
-        DjangoModelPermissionsOrAnonReadOnly,
+        DjangoModelPermissions,
         V3APIPermission,
     ]
     ordering_fields = ("id", "date_created", "date_modified")
@@ -205,11 +208,11 @@ class PositionViewSet(
 class ReimbursementViewSet(
     LoggingMixin, DeferredFieldsMixin, viewsets.ModelViewSet
 ):
-    queryset = Reimbursement.objects.all().order_by("-id")
+    queryset = disclosure_child_queryset(Reimbursement)
     serializer_class = ReimbursementSerializer
     filterset_class = ReimbursementFilter
     permission_classes = [
-        DjangoModelPermissionsOrAnonReadOnly,
+        DjangoModelPermissions,
         V3APIPermission,
     ]
     ordering_fields = ("id", "date_created", "date_modified")
@@ -226,11 +229,11 @@ class ReimbursementViewSet(
 class SpouseIncomeViewSet(
     LoggingMixin, DeferredFieldsMixin, viewsets.ModelViewSet
 ):
-    queryset = SpouseIncome.objects.all().order_by("-id")
+    queryset = disclosure_child_queryset(SpouseIncome)
     serializer_class = SpouseIncomeSerializer
     filterset_class = SpouseIncomeFilter
     permission_classes = [
-        DjangoModelPermissionsOrAnonReadOnly,
+        DjangoModelPermissions,
         V3APIPermission,
     ]
     ordering_fields = ("id", "date_created", "date_modified")

@@ -10,7 +10,7 @@ import time_machine
 from asgiref.sync import async_to_sync
 from dateutil.tz import tzoffset, tzutc
 from django.conf import settings
-from django.contrib import admin, messages
+from django.contrib import admin
 from django.contrib.auth.hashers import make_password
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
@@ -23,20 +23,27 @@ from django.utils.timezone import now
 from elasticsearch.dsl import Q
 from factory import RelatedFactory
 from lxml import html
+from selenium.common.exceptions import (
+    NoSuchElementException,
+    StaleElementReferenceException,
+    TimeoutException,
+)
 from selenium.webdriver.common.by import By
+from selenium.webdriver.remote.webelement import WebElement
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.wait import WebDriverWait
 from timeout_decorator import timeout_decorator
 from waffle.testutils import override_flag
 
 from cl.audio.factories import AudioFactory
-from cl.favorites.factories import NoteFactory, UserTagFactory
+from cl.lib.decorators import clear_tiered_cache
 from cl.lib.elasticsearch_utils import (
     build_daterange_query,
     simplify_estimated_count,
 )
 from cl.lib.indexing_utils import log_last_document_indexed
 from cl.lib.redis_utils import get_redis_interface
+from cl.lib.search_utils import merge_form_with_courts
 from cl.lib.storage import clobbering_get_name
 from cl.lib.test_helpers import CourtTestCase, PeopleTestCase
 from cl.lib.utils import (
@@ -88,7 +95,6 @@ from cl.search.models import (
     SEARCH_TYPES,
     CaseTransfer,
     Citation,
-    ClusterRedirection,
     Court,
     Docket,
     DocketEntry,
@@ -105,7 +111,7 @@ from cl.search.types import EventTable
 from cl.tests.base import SELENIUM_TIMEOUT, BaseSeleniumTest
 from cl.tests.cases import ESIndexTestCase, TestCase, TransactionTestCase
 from cl.tests.utils import get_with_wait
-from cl.users.factories import UserFactory, UserProfileWithParentsFactory
+from cl.users.factories import UserProfileWithParentsFactory
 
 
 class ModelTest(TestCase):
@@ -1685,6 +1691,46 @@ class OpinionSearchFunctionalTest(BaseSeleniumTest):
         result_count = self.browser.find_element(By.ID, "result-count")
         self.assertIn("Opinions", result_count.text)
 
+    def _get_opinion_tab(self, label: str) -> WebElement:
+        """Find a tab in the opinion detail page's tab bar by its label.
+
+        :param label: The tab's label, e.g. "Cited By". Non-breaking spaces in
+            the rendered label are matched by a regular space.
+        :return: The tab's link element.
+        """
+        return self.browser.find_element(
+            By.XPATH,
+            "//ul[contains(@class, 'nav-tabs')]//li"
+            f"//a[contains(translate(., '\u00a0', ' '), '{label}')]",
+        )
+
+    def _get_opinion_tab_count(self, label: str) -> int:
+        """Return the count shown on an opinion tab, e.g. 13 for "Cited By (13)".
+
+        :param label: The tab's label, e.g. "Cited By".
+        :return: The count displayed on the tab.
+        :raises AssertionError: If no count appears before the Selenium timeout.
+        """
+        try:
+            match = WebDriverWait(
+                self.browser,
+                SELENIUM_TIMEOUT,
+                # The tab goes stale while htmx swaps the bar out from under us.
+                ignored_exceptions=(
+                    NoSuchElementException,
+                    StaleElementReferenceException,
+                ),
+            ).until(
+                lambda _: re.search(
+                    r"\((\d+)\)", self._get_opinion_tab(label).text
+                )
+            )
+        except TimeoutException:
+            self.fail(
+                f'"{label}" tab text must contain a number in parentheses (e.g., "(13)")'
+            )
+        return int(match.group(1))
+
     def test_query_cleanup_integration(self) -> None:
         # Dora goes to CL and performs a Search using a numbered citation
         # (e.g. "12-9238" or "3:18-cv-2383")
@@ -1736,7 +1782,7 @@ class OpinionSearchFunctionalTest(BaseSeleniumTest):
         text_box.send_keys("1337")
         text_box.submit()
 
-        # The SERP refreshes and she sees resuls that
+        # The SERP refreshes and she sees results that
         # only contain fragments of the docker number she entered
         new_count = self.extract_result_count_from_serp()
         self.assertTrue(new_count < initial_count)
@@ -1749,8 +1795,9 @@ class OpinionSearchFunctionalTest(BaseSeleniumTest):
     def test_opinion_search_result_detail_page(self) -> None:
         # Dora navigates to CL and does a simple wild card search
         self.browser.get(self.live_server_url)
-        self.browser.find_element(By.ID, "id_q").send_keys("voutila")
-        self.browser.find_element(By.ID, "id_q").submit()
+        searchbox = self.browser.find_element(By.ID, "id_q")
+        searchbox.send_keys("voutila")
+        searchbox.submit()
 
         # Seeing an Opinion immediately on the first page of results, she
         # wants more details so she clicks the title and drills into the result
@@ -1783,23 +1830,13 @@ class OpinionSearchFunctionalTest(BaseSeleniumTest):
         )
 
         # Verify "Cited By" tab exists and it has a count on it
-        cited_by_tab = self.browser.find_element(
-            By.XPATH,
-            '//ul[contains(@class, "nav-tabs")]//li//a[contains(., "Cited\u00a0By")]',
-        )
-        self.assertIsNotNone(cited_by_tab, "'Cited By' tab does not exist")
-        cited_by_count = re.search(r"\((\d+)\)", cited_by_tab.text)
-        self.assertIsNotNone(
-            cited_by_count,
-            '"Cited By" tab text must contain a number in parentheses (e.g., "(13)")',
-        )
-        cited_by_count = int(cited_by_count.group(1))
+        cited_by_count = self._get_opinion_tab_count("Cited By")
         self.assertGreaterEqual(
             cited_by_count, 1, f"Wrong Cited By count: {cited_by_count}"
         )
 
         # Go to cited by page and verify we loaded it correctly and then go back to main page
-        cited_by_tab.click()
+        self._get_opinion_tab("Cited By").click()
         section_title = self.browser.find_element(
             By.CSS_SELECTOR, ".opinion-section-title"
         )
@@ -1819,19 +1856,7 @@ class OpinionSearchFunctionalTest(BaseSeleniumTest):
         self.browser.back()
 
         # Verify "Authorities" tab exists and it has a count on it
-        authorities_tab = self.browser.find_element(
-            By.XPATH,
-            '//ul[contains(@class, "nav-tabs")]//li//a[contains(., "Authorities")]',
-        )
-        self.assertIsNotNone(
-            authorities_tab, "'Authorities' tab does not exist"
-        )
-        authorities_count = re.search(r"\((\d+)\)", authorities_tab.text)
-        self.assertIsNotNone(
-            authorities_count,
-            '"Authorities" tab text must contain a number in parentheses (e.g., "(13)")',
-        )
-        authorities_count = int(authorities_count.group(1))
+        authorities_count = self._get_opinion_tab_count("Authorities")
         self.assertGreaterEqual(
             authorities_count,
             1,
@@ -1839,7 +1864,7 @@ class OpinionSearchFunctionalTest(BaseSeleniumTest):
         )
 
         # Go to authorities page and verify we loaded it correctly and then go back to main page
-        authorities_tab.click()
+        self._get_opinion_tab("Authorities").click()
         section_title = self.browser.find_element(
             By.CSS_SELECTOR, ".opinion-section-title"
         )
@@ -1912,7 +1937,10 @@ class OpinionSearchFunctionalTest(BaseSeleniumTest):
     @override_flag("store-search-queries", active=True)
     @override_settings(WAFFLE_CACHE_PREFIX="test_opinion_search_functions")
     def test_basic_homepage_search_and_signin_and_signout(self) -> None:
-        wait = WebDriverWait(self.browser, 1)
+        # Every lookup below is for something that should be there, so budget
+        # the same as the rest of the suite. A one second budget passes only on
+        # a machine that never hesitates.
+        wait = WebDriverWait(self.browser, SELENIUM_TIMEOUT)
 
         # Dora navigates to the CL website.
         self.browser.get(self.live_server_url)
@@ -2064,7 +2092,7 @@ class OpinionSearchFunctionalTest(BaseSeleniumTest):
             "a SearchQuery with get_params 'q=lissner' and 'pandora' user should have been created",
         )
 
-        # Test if the SearchQuery get's deleted when the user is deleted
+        # Test if the SearchQuery gets deleted when the user is deleted
         self.pandora_profile.user.delete()
         lookup.pop("user")
         self.assertFalse(
@@ -2244,6 +2272,83 @@ class SaveSearchQueryTest(TestCase):
             SearchQuery.ELASTICSEARCH,
             f"Saved wrong `engine` value, expected {SearchQuery.ELASTICSEARCH}",
         )
+
+
+@override_flag("store-search-api-queries", active=True)
+@override_flag("store-search-queries", active=True)
+@override_settings(WAFFLE_CACHE_PREFIX="test_save_query_history")
+class SaveQueryHistoryTest(TestCase):
+    """Do we honor the user's save_query_history preference?"""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        patcher = mock.patch(
+            "cl.lib.decorators.get_tiered_cache_prefix",
+            new=lambda: "tiered_save_query_history_test",
+        )
+        patcher.start()
+        cls.addClassCleanup(patcher.stop)
+
+    def setUp(self) -> None:
+        clear_tiered_cache()
+        self.website_url = f"{reverse('show_results')}?q=lissner"
+        self.api_url = (
+            f"{reverse('search-list', kwargs={'version': 'v4'})}?q=lissner"
+        )
+
+    def tearDown(self) -> None:
+        clear_tiered_cache()
+
+    def test_save_query_history(self) -> None:
+        """Are queries saved only for users who want them saved?"""
+        for source, url in (
+            (SearchQuery.WEBSITE, self.website_url),
+            (SearchQuery.API, self.api_url),
+        ):
+            for save_query_history in (True, False):
+                with self.subTest(
+                    source=source, save_query_history=save_query_history
+                ):
+                    profile = UserProfileWithParentsFactory(
+                        save_query_history=save_query_history
+                    )
+                    self.client.force_login(profile.user)
+                    self.client.get(url)
+                    self.assertEqual(
+                        SearchQuery.objects.filter(
+                            user=profile.user, source=source
+                        ).exists(),
+                        save_query_history,
+                    )
+
+    def test_api_caches_save_query_history(self) -> None:
+        """Does the API use a cached preference until it expires?"""
+        profile = UserProfileWithParentsFactory(save_query_history=True)
+        self.client.force_login(profile.user)
+        queries = SearchQuery.objects.filter(
+            user=profile.user, source=SearchQuery.API
+        )
+        self.client.get(self.api_url)
+        self.assertEqual(queries.count(), 1)
+
+        profile.save_query_history = False
+        profile.save()
+        self.client.get(self.api_url)
+        self.assertEqual(queries.count(), 2, "Cached value not used.")
+
+        # The website reads the profile directly, without the cache.
+        self.client.get(self.website_url)
+        self.assertFalse(
+            SearchQuery.objects.filter(
+                user=profile.user, source=SearchQuery.WEBSITE
+            ).exists()
+        )
+
+        # Simulate the cache expiring.
+        clear_tiered_cache()
+        self.client.get(self.api_url)
+        self.assertEqual(queries.count(), 2, "Cache did not expire.")
 
 
 class CaptionTest(TestCase):
@@ -3627,7 +3732,6 @@ class AdminActionsTest(TestCase):
     def setUpTestData(cls):
         cls.factory = RequestFactory()
         cls.court_1 = CourtFactory(id="nyappdiv")
-        cls.court_2 = CourtFactory(id="ca6")
 
         cls.cluster_1 = OpinionClusterWithParentsFactory(
             docket=DocketFactory(
@@ -3640,150 +3744,48 @@ class AdminActionsTest(TestCase):
             judges="Doe",
         )
 
-        cls.docket_1 = DocketFactory(
-            court=cls.court_2,
-            source=Docket.HARVARD_AND_RECAP,
-        )
-        cls.de_1 = DocketEntryFactory(
-            docket=cls.docket_1,
-            entry_number=23,
-            date_filed=datetime.date(2015, 8, 4),
-            description="Main Document",
-        )
-        cls.cluster_2 = OpinionClusterFactory.create(
-            precedential_status=PRECEDENTIAL_STATUS.PUBLISHED,
-            docket=cls.docket_1,
-            date_filed=datetime.date(2024, 8, 23),
-            case_name="Foo v. Bar",
-            source="U",
-        )
-
-        cls.user_1 = UserFactory()
-
-        cls.cluster_3 = OpinionClusterWithParentsFactory(
-            docket=DocketFactory(
-                court=cls.court_1,
-                case_name="Lorem v. Ipsum",
-                case_name_full="Lorem v. Ipsum",
-            ),
-            case_name="Lorem v. Ipsum",
-            date_filed=datetime.date.today(),
-            judges="Doe",
-        )
-
-        # The docket from the associated clusted has an user tag
-        cls.tag_1_user_1 = UserTagFactory(user=cls.user_1, name="tag_1_user_1")
-        cls.tag_1_user_1.dockets.add(cls.cluster_3.docket.pk)
-
-        # The cluster has an user note
-        cls.note_cluster_3_user_1 = NoteFactory(
-            user=cls.user_1,
-            cluster_id=cls.cluster_3,
-            notes="Note Test",
-        )
-
-    def test_seal_cluster_action(self):
-        """Test seal_clusters action in OpinionCluster admin page"""
-        # Test 1: Can we seal cluster without any blockages and create redirection?
-
-        cluster_pk = self.cluster_1.pk
-        docket_pk = self.cluster_1.docket.pk
-
-        # Call seal_clusters action.
+    def test_get_search_results_valid_pk(self):
+        """get_search_results returns the matching cluster for a valid PK."""
         clusters_admin = OpinionClusterAdmin(OpinionCluster, self.site)
-        clusters_admin.message_user = mock.Mock()
-        url = reverse("admin:search_opinioncluster_changelist")
-        request = self.factory.post(url)
-
-        queryset = OpinionCluster.objects.filter(pk=cluster_pk)
-        clusters_admin.seal_clusters(request, queryset)
-
-        # Check sealed correctly
-        clusters_admin.message_user.assert_called_once_with(
-            request,
-            "Sealed 1 cluster(s).",
-            messages.SUCCESS,
+        request = self.factory.get(
+            reverse("admin:search_opinioncluster_changelist")
         )
-        # Check docket has been removed
-        docket = Docket.objects.filter(pk=docket_pk)
-        self.assertEqual(
-            docket.count(),
-            0,
-            msg="Docket has not been removed after sealing the cluster.",
+        qs = OpinionCluster.objects.all()
+        results, use_distinct = clusters_admin.get_search_results(
+            request, qs, str(self.cluster_1.pk)
         )
-        # Check cluster redirection has been created
-        redirection = ClusterRedirection.objects.filter(
-            reason=ClusterRedirection.SEALED,
-            deleted_cluster_id=cluster_pk,
-            cluster=None,
+        self.assertIn(self.cluster_1, results)
+        self.assertEqual(results.count(), 1)
+        self.assertFalse(use_distinct)
+
+    def test_get_search_results_invalid_string(self):
+        """get_search_results returns an empty queryset for a non-integer."""
+        clusters_admin = OpinionClusterAdmin(OpinionCluster, self.site)
+        request = self.factory.get(
+            reverse("admin:search_opinioncluster_changelist")
         )
-        self.assertEqual(
-            redirection.count(),
-            1,
-            msg="Got incorrect number of ClusterRedirection results",
+        qs = OpinionCluster.objects.all()
+        results, use_distinct = clusters_admin.get_search_results(
+            request, qs, "not-a-pk"
         )
-        clusters_admin.message_user.reset_mock()
+        self.assertEqual(results.count(), 0)
+        self.assertFalse(use_distinct)
 
-        # Test 2: Can we seal a cluster but not removing the docket and create redirection?
-        cluster2_pk = self.cluster_2.pk
-        docket2_pk = self.cluster_2.docket.pk
-
-        queryset = OpinionCluster.objects.filter(pk=cluster2_pk)
-        clusters_admin.seal_clusters(request, queryset)
-
-        # Check sealed correctly
-        clusters_admin.message_user.assert_called_once_with(
-            request,
-            "Sealed 1 cluster(s).",
-            messages.SUCCESS,
+    def test_get_search_results_empty_string(self):
+        """get_search_results returns the full queryset for an empty term."""
+        clusters_admin = OpinionClusterAdmin(OpinionCluster, self.site)
+        request = self.factory.get(
+            reverse("admin:search_opinioncluster_changelist")
         )
-
-        # Check that docket has not been removed
-        docket = Docket.objects.filter(pk=docket2_pk)
-        self.assertEqual(
-            docket.count(),
-            1,
-            msg="Docket shouldn't have been removed after sealing the cluster.",
-        )
-
-        # Check that the cluster redirection was still created.
-        redirection = ClusterRedirection.objects.filter(
-            reason=ClusterRedirection.SEALED,
-            deleted_cluster_id=cluster2_pk,
-            cluster=None,
+        qs = OpinionCluster.objects.all()
+        results, use_distinct = clusters_admin.get_search_results(
+            request, qs, ""
         )
         self.assertEqual(
-            redirection.count(),
-            1,
-            msg="Got more or less ClusterRedirection results",
+            set(results.values_list("pk", flat=True)),
+            set(qs.values_list("pk", flat=True)),
         )
-        clusters_admin.message_user.reset_mock()
-
-        # Test 3: Can we block seal if something is related to cluster? No, user related information exists
-        cluster3_pk = self.cluster_3.pk
-
-        queryset = OpinionCluster.objects.filter(pk=cluster3_pk)
-        clusters_admin.seal_clusters(request, queryset)
-
-        # Check cannot be sealed
-        clusters_admin.message_user.assert_called_once_with(
-            request,
-            f'ERROR: Problem sealing cluster id: {cluster3_pk} - <a href="/admin/search/opinioncluster/blocking-confirmation/{cluster3_pk}/" target="_blank">View Dependencies</a>',
-            messages.WARNING,
-        )
-
-        # Check blocking objects:
-        get_blocking_relations = clusters_admin.get_blocking_relations(
-            self.cluster_3
-        )
-
-        user_tag_qs = get_blocking_relations.get("favorites.UserTag")
-        self.assertTrue(user_tag_qs.exists())
-        self.assertIn(self.tag_1_user_1, user_tag_qs)
-
-        note_qs = get_blocking_relations.get("favorites.Note")
-        self.assertTrue(note_qs.exists())
-        self.assertIn(self.note_cluster_3_user_1, note_qs)
+        self.assertFalse(use_distinct)
 
 
 class PopulateDocketNumberRawCommandTest(TestCase):
@@ -4080,6 +4082,28 @@ class SearchFormCourtCleanTest(TestCase):
         cd = form.cleaned_data
         court_ids = set(cd["court"].split())
         self.assertEqual(court_ids, {"scotus", "ca1"})
+
+    def test_merge_form_with_courts_marks_checked_courts(self) -> None:
+        search_form = SearchForm(
+            QueryDict("q=test&type=o&court_scotus=on&court_ca2=on"),
+            courts=[self.court_scotus, self.court_ca1, self.court_ca2],
+        )
+        self.assertTrue(search_form.is_valid())
+
+        court_tabs, court_count_human, court_count = merge_form_with_courts(
+            [self.court_scotus, self.court_ca1, self.court_ca2],
+            search_form,
+        )
+
+        self.assertEqual(court_count_human, "2")
+        self.assertEqual(court_count, "2")
+        checked_by_id = {
+            court.pk: court.checked for court in court_tabs["federal"]
+        }
+        self.assertEqual(
+            checked_by_id,
+            {"scotus": True, "ca1": False, "ca2": True},
+        )
 
     def test_no_court_selection_results_in_empty_court_filter(self) -> None:
         """With no court selection, all picker booleans default to True"""

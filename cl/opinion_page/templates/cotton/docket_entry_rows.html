@@ -1,0 +1,163 @@
+{% load tz svg_tags %}
+
+<c-vars
+  docket_entries=""
+  docket_source=""
+  filters_applied=""
+  class=""
+/>
+
+<div class="{{ class }}">
+{% if docket_entries %}
+  {# Column headers — desktop only #}
+  <div class="hidden md:flex border-b border-greyscale-200 bg-greyscale-100 rounded-lg px-4 py-2 text-sm font-medium text-greyscale-700">
+    <div class="w-28 shrink-0">Document Number</div>
+    <div class="w-32 shrink-0">Date Filed</div>
+    <div class="flex-1">Description</div>
+  </div>
+
+  <ol role="list" class="list-none p-0 m-0" aria-label="Docket entries">
+    {% for entry in docket_entries %}
+      <li id="{% if entry.entry_number %}entry-{{ entry.entry_number }}{% else %}minute-entry-{{ entry.pk }}{% endif %}"
+          class="border-b border-greyscale-200 px-4 py-4">
+        {# Entry header #}
+        <div class="flex gap-2">
+          <dl class="flex-1 flex flex-wrap items-start md:flex-nowrap text-sm m-0">
+            <div class="md:w-28 md:shrink-0">
+              <dt class="sr-only">Document Number</dt>
+              <dd class="font-medium md:font-normal text-greyscale-900">
+                {{ entry.entry_number|default_if_none:"" }}
+              </dd>
+            </div>
+            <div class="ml-auto md:ml-0 md:w-32 md:shrink-0 text-greyscale-700">
+              <dt class="sr-only">Date Filed</dt>
+              <dd>
+                {% if entry.datetime_filed %}
+                  <time datetime="{{ entry.datetime_filed|date:'c' }}" aria-label="{{ entry.datetime_filed|timezone:timezone }}">{{ entry.datetime_filed|timezone:timezone|date:"M j, Y" }}</time>
+                {% elif entry.date_filed %}
+                  <time datetime="{{ entry.date_filed|date:'c' }}">{{ entry.date_filed|date:"M j, Y" }}</time>
+                {% endif %}
+              </dd>
+            </div>
+            <div class="basis-full mt-1 md:basis-auto md:mt-0 md:flex-1 text-greyscale-900">
+              <dt class="sr-only">Description</dt>
+              <dd>{% if entry.description %}<p>{{ entry.description }}</p>{% endif %}</dd>
+            </div>
+          </dl>
+
+          {# Direct link anchor #}
+          {% if entry.entry_number %}
+            <a
+              href="#entry-{{ entry.entry_number }}"
+              class="flex items-start text-greyscale-400 hover:text-greyscale-600 focus-visible:ring-2 focus-visible:ring-primary-400 focus-visible:outline-none rounded shrink-0 pt-0.5"
+              aria-label="Direct link to entry {{ entry.entry_number }}"
+              title="Direct link to this entry"
+            >
+              {% svg "forward" class="w-4 h-4" aria_hidden="true" %}
+            </a>
+          {% endif %}
+        </div>
+
+        {% if entry.documents %}
+          <ul role="list" class="list-none p-0 m-0" aria-label="Documents for this entry">
+            {% for document in entry.documents %}
+              <li class="mt-3 md:ml-28">
+                <div class="flex flex-wrap items-start gap-2">
+                  {# Type badge — fixed width to align with date column #}
+                  <div class="w-32 shrink-0">
+                    {% if document.detail_url %}
+                      <a href="{{ document.detail_url }}" rel="nofollow" class="links text-sm font-medium">
+                        {{ document.label }}
+                      </a>
+                    {% else %}
+                      <span class="text-greyscale-900 text-sm font-medium">{{ document.label }}</span>
+                    {% endif %}
+                    {# Mobile: description below badge #}
+                    {% if document.description %}
+                      <p class="md:hidden text-sm text-greyscale-900 mt-0.5">{{ document.description }}</p>
+                    {% endif %}
+                  </div>
+
+                  {# Desktop: description in its own column (or empty spacer to preserve flex layout) #}
+                  {% if document.description %}
+                    <p class="hidden md:block flex-1 text-sm text-greyscale-900 min-w-48">{{ document.description }}</p>
+                  {% else %}
+                    <div class="hidden md:block flex-1"></div>
+                  {% endif %}
+
+                  {# Action buttons #}
+                  {% if document.has_actions %}
+                    <div class="shrink-0 flex flex-wrap items-center gap-2">
+                      {% if document.filepath_local %}
+                        {# State 1: We have the PDF — download dropdown #}
+                        <c-menu-button
+                          button_variant="dark"
+                          button_class="text-sm px-3 py-1.5"
+                          menu_class="z-20 w-55 border border-greyscale-200 shadow-lg rounded-lg bg-white py-2"
+                          position="bottom-end"
+                          widget_aria_label="Download options for {{ document.label }}"
+                          trigger_aria_label="Download PDF"
+                          menu_aria_label="Download sources"
+                        >
+                          <c-slot name="button_content">
+                            Download PDF
+                            {% svg "chevron" class="w-3 h-3 text-white ml-1" aria_hidden="true" %}
+                          </c-slot>
+                          <c-slot name="menu_content">
+                            <c-menu-button.item
+                              href="{{ document.filepath_local.url }}"
+                              rel="nofollow"
+                            >
+                              From CourtListener
+                            </c-menu-button.item>
+                            {% if document.filepath_ia %}
+                              <c-menu-button.item
+                                href="{{ document.filepath_ia }}"
+                                rel="nofollow"
+                              >
+                                From Internet Archive
+                              </c-menu-button.item>
+                            {% endif %}
+                            <c-document-source-link :document="document" :docket_source="docket_source" variant="menu_item" />
+                          </c-slot>
+                        </c-menu-button>
+                      {% elif document.is_sealed %}
+                        {# State 2: Sealed. Only sources whose document model #}
+                        {# has the is_sealed field can reach this state. #}
+                        <c-button variant="outline" disabled aria-disabled="true" class="text-sm px-3 py-1.5">
+                          Unavailable
+                        </c-button>
+                        <c-document-source-link :document="document" :docket_source="docket_source" variant="check_availability" />
+                        {% if docket_source.has_pay_and_pray %}
+                          {# Pray-and-pay for sealed docs #}
+                          <c-pray-button :document_id="document.id" :count="document.prayer_count" :prayer_exists="document.prayer_exists" />
+                        {% endif %}
+                      {% elif document.external_url %}
+                        {# State 3: Only the source has it #}
+                        <c-document-source-link :document="document" :docket_source="docket_source" variant="button" />
+                        {% if docket_source.has_pay_and_pray %}
+                          {# Pray-and-pay for docs we'd have to buy #}
+                          <c-pray-button :document_id="document.id" :count="document.prayer_count" :prayer_exists="document.prayer_exists" />
+                        {% endif %}
+                      {% endif %}
+                    </div>
+                  {% endif %}
+                </div>
+              </li>
+            {% endfor %}
+          </ul>
+        {% endif %}
+      </li>
+    {% endfor %}
+  </ol>
+{% else %}
+  {# An empty page means either the filters excluded every entry or the docket has none yet. #}
+  <div class="px-4 py-8 text-center text-sm text-greyscale-700">
+    {% if filters_applied %}
+      <p>No docket entries match your filters.</p>
+    {% else %}
+      <p>{{ docket_source.empty_message }}</p>
+    {% endif %}
+  </div>
+{% endif %}
+</div>

@@ -49,7 +49,11 @@ from cl.search.tasks import (
     update_children_docs_by_query,
     update_es_document,
 )
-from cl.search.types import ESDocumentClassType, ESModelType
+from cl.search.types import (
+    ESDocumentClassType,
+    ESModelClassType,
+    ESModelType,
+)
 
 
 def check_fields_that_changed(
@@ -71,7 +75,15 @@ def check_fields_that_changed(
     changed.
     """
     changed_fields = []
+    # A field deferred during the merge process (`add_docket_entries`) in
+    # `chunked_docket_entries` was neither read nor assigned after the instance
+    # was loaded. Django's `save()` omits deferred fields from the `UPDATE`, so
+    # they cannot have changed. Skip them to prevent `getattr()` from triggering
+    # a per-field query to fetch their values.
+    deferred_fields = current_instance.get_deferred_fields()
     for field in tracked_set.fields:
+        if field in deferred_fields:
+            continue
         current_value = getattr(current_instance, field)
         if previous_instance:
             previous_value = getattr(previous_instance, field)
@@ -153,7 +165,7 @@ def get_fields_to_update(
 
 
 def update_es_documents(
-    main_model: ESModelType,
+    main_model: ESModelClassType,
     es_document: ESDocumentClassType,
     instance: ESModelType,
     created: bool,
@@ -338,7 +350,7 @@ def update_es_documents(
 
 
 def update_remove_m2m_documents(
-    main_model: ESModelType,
+    main_model: ESModelClassType,
     es_document: ESDocumentClassType,
     instance: ESModelType,
     mapping_fields: dict,
@@ -354,7 +366,7 @@ def update_remove_m2m_documents(
     :return: None
     """
     for key, fields_map in mapping_fields.items():
-        if main_model.__name__.lower() != key:  # type: ignore
+        if main_model.__name__.lower() != key:
             # The m2m relationship is not defined in the main model but
             # we use the relationship to add data to the ES documents.
             main_objects = main_model.objects.filter(**{key: instance})
@@ -409,7 +421,7 @@ def update_m2m_field_in_es_document(
 
 
 def update_reverse_related_documents(
-    main_model: ESModelType,
+    main_model: ESModelClassType,
     es_document: ESDocumentClassType,
     instance: ESModelType,
     query_string: str,
@@ -507,7 +519,7 @@ def update_reverse_related_documents(
 
 
 def delete_reverse_related_documents(
-    main_model: ESModelType,
+    main_model: ESModelClassType,
     es_document: ESDocumentClassType,
     instance: ESModelType,
     query_string: str,
@@ -650,7 +662,7 @@ def remove_non_judge_person_and_positions_from_index(
     :return: None
     """
     try:
-        if instance.person.is_judge:
+        if (person := instance.person) is None or person.is_judge:
             # The Person is still a Judge, return.
             return
 

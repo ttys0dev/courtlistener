@@ -3,6 +3,7 @@ import sys
 import time
 import traceback
 from datetime import date
+from types import ModuleType
 from typing import Any
 
 from asgiref.sync import async_to_sync, sync_to_async
@@ -10,6 +11,7 @@ from django.core.files.base import ContentFile
 from django.core.management.base import CommandError
 from django.db import transaction
 from django.utils.encoding import force_bytes
+from juriscraper.AbstractSite import AbstractSite
 from juriscraper.lib.exceptions import BadContentError, InvalidDocumentError
 from juriscraper.lib.importer import build_module_list
 from juriscraper.lib.string_utils import CaseNameTweaker
@@ -181,7 +183,13 @@ def make_objects(
             ordering_key=opinion_metadata.get("ordering_key"),
         )
 
-        cf = ContentFile(content)
+        # Encode str content to bytes so the file's reported size is the UTF-8
+        # byte count, not the character count. django-storages sends that size
+        # as x-amz-decoded-content-length on the aws-chunked PUT; for non-ASCII
+        # text (e.g. Westlaw HTML with curly quotes/em-dashes) a character count
+        # is short of the real byte count, and S3 rejects the upload with
+        # 500 InternalError. See #7504.
+        cf = ContentFile(force_bytes(content))
         extension = get_extension(content)
         file_name = trunc(item["case_names"].lower(), 75) + extension
         opinion.file_with_date = cluster.date_filed
@@ -285,7 +293,7 @@ class Command(ScraperCommand):
 
     async def scrape_court(
         self,
-        site,
+        site: AbstractSite,
         full_crawl: bool = False,
         ocr_available: bool = True,
         backscrape: bool = False,
@@ -343,7 +351,12 @@ class Command(ScraperCommand):
             await sync_to_async(dup_checker.update_site_hash)(site.hash)
 
     async def get_opinions_content(
-        self, case_dict: dict, site, court, dup_checker, next_case_date
+        self,
+        case_dict: dict,
+        site: AbstractSite,
+        court,
+        dup_checker,
+        next_case_date,
     ) -> list[tuple[dict, bytes, str]]:
         """Downloads opinions and checks if the content is duplicated
 
@@ -352,7 +365,7 @@ class Command(ScraperCommand):
         opinions_content = []
         opinions_to_download = []
 
-        # this field is populated when usign cl_back_scrape_citations
+        # this field is populated when using cl_back_scrape_citations
         if case_dict.get("content"):
             content = case_dict.pop("content")
             opinions_content.append(
@@ -427,7 +440,7 @@ class Command(ScraperCommand):
         item,
         next_case_date: date | None,
         ocr_available: bool,
-        site,
+        site: AbstractSite,
         dup_checker: DupChecker,
         court: Court,
     ):
@@ -473,9 +486,13 @@ class Command(ScraperCommand):
                 item["case_names"].encode(),
             )
 
-    async def parse_and_scrape_site(self, mod, options: dict):
-        site = await mod.Site(save_response_fn=save_response).parse()
-        await self.scrape_court(site, options["full_crawl"])
+    async def parse_and_scrape_site(
+        self, mod: ModuleType, options: dict[str, Any]
+    ) -> None:
+        """Parse and scrape a court, closing its HTTP client on every exit."""
+        async with mod.Site(save_response_fn=save_response) as site:
+            await site.parse()
+            await self.scrape_court(site, options["full_crawl"])
 
     def handle(self, *args, **options):
         super().handle(*args, **options)

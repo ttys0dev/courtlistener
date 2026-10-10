@@ -31,6 +31,8 @@ def normalize_time_unit(rate: str) -> str:
 class ThrottleType(models.IntegerChoices):
     API = 1, "API"
     CITATION_LOOKUP = 2, "Citation Lookup"
+    ALERTS = 3, "Alerts"
+    RECAP_FETCH = 4, "RECAP Fetch"
 
 
 @pghistory.track()

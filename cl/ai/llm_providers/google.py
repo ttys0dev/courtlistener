@@ -1,7 +1,6 @@
 import json
 import logging
 import mimetypes
-import os
 import tempfile
 from datetime import date
 from typing import Any, TypedDict
@@ -21,11 +20,13 @@ DOWNLOADABLE_JOB_STATES = {
 # Maps model name to its shutdown date (None if no date announced).
 # See https://ai.google.dev/gemini-api/docs/deprecations
 SUPPORTED_GEMINI_MODELS: dict[str, date | None] = {
+    "gemini-3.5-flash": None,
     "gemini-3.1-pro-preview": None,
+    "gemini-3.1-flash-lite": date(2027, 5, 7),
     "gemini-3-flash-preview": None,
-    "gemini-2.5-pro": date(2026, 6, 17),
-    "gemini-2.5-flash": date(2026, 6, 17),
-    "gemini-2.5-flash-lite": date(2026, 7, 22),
+    "gemini-2.5-pro": date(2026, 10, 16),
+    "gemini-2.5-flash": date(2026, 10, 16),
+    "gemini-2.5-flash-lite": date(2026, 10, 16),
 }
 
 
@@ -288,22 +289,18 @@ class GoogleGenAIBatchWrapper:
         jsonl_content = "\n".join(json.dumps(req) for req in requests)
 
         with tempfile.NamedTemporaryFile(
-            mode="w+", delete=False, suffix=".jsonl"
+            mode="w+", delete_on_close=False, suffix=".jsonl"
         ) as temp_f:
             temp_f.write(jsonl_content)
             temp_f.flush()
-            temp_file_path = temp_f.name
 
-        try:
             jsonl_file = self.client.files.upload(
-                file=temp_file_path,
+                file=temp_f.name,
                 config=types.UploadFileConfig(
                     display_name=batch_display_name,
                     mime_type="application/jsonl",
                 ),
             )
-        finally:
-            os.remove(temp_file_path)
 
         config = types.CreateBatchJobConfig(display_name=batch_display_name)
 

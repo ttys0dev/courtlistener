@@ -14,7 +14,7 @@ from django.template import loader
 from django.urls import reverse
 from django.utils.timezone import now
 from elasticsearch.exceptions import ConnectionError
-from waffle import switch_is_active
+from redis import ConnectionError as RedisConnectionError
 
 from cl.alerts.models import Alert, DocketAlert, ScheduledAlertHit
 from cl.alerts.utils import (
@@ -26,6 +26,7 @@ from cl.alerts.utils import (
     override_alert_query,
     percolate_es_document,
     prepare_percolator_content,
+    remove_alert_hits_set,
     scheduled_alert_hits_limit_reached,
     transform_percolator_child_document,
 )
@@ -37,6 +38,7 @@ from cl.api.tasks import (
 from cl.celery_init import app
 from cl.custom_filters.templatetags.text_filters import best_case_name
 from cl.favorites.models import Note, UserTag
+from cl.favorites.utils import build_dual_read_query
 from cl.lib.command_utils import logger
 from cl.lib.decorators import retry
 from cl.lib.redis_utils import (
@@ -187,7 +189,9 @@ def get_docket_notes_and_tags_by_user(
 
     notes = None
     note = (
-        Note.objects.filter(docket_id=d_pk, user_id=user_pk)
+        Note.objects.filter(
+            build_dual_read_query(Docket, d_pk), user_id=user_pk
+        )
         .only("notes")
         .first()
     )
@@ -227,7 +231,9 @@ def make_alert_messages(
         "docket": d,
         "docket_alert_secret_key": None,
         "timezone": COURT_TIMEZONES.get(d.court_id, "US/Eastern"),
-        "recap_alerts_banner": switch_is_active("recap-alerts-email-banner"),
+        # Emails render without request context processors, so the wiki URL
+        # must be injected here for the tag/note help links.
+        "WIKI_HELP_URL": settings.WIKI_HELP_BASE_URL,
     }
     messages = []
     for recipient in da_recipients:
@@ -453,16 +459,18 @@ def send_recap_email_user_not_found(recap_email_recipients: list[str]) -> None:
 
 
 def send_webhook_alert_hits(
-    alert_user: UserProfile.user, hits: list[SearchAlertHitType]
-) -> None:
+    alert_user: User, hits: list[SearchAlertHitType]
+) -> bool:
     """Send webhook alerts for search hits.
     :param alert_user: The user profile object associated with the webhooks.
     :param hits: A list of tuples, each containing information about an alert,
     its associated search type, documents found, and the number of documents.
-    :return: None
+    :return: True if at least one webhook was queued for delivery, else False.
     """
 
+    webhook_sent = False
     for alert, search_type, documents, num_docs in hits:
+        # pyrefly:ignore[missing-attribute]
         user_webhooks = alert_user.webhooks.filter(
             event_type=WebhookEventType.SEARCH_ALERT, enabled=True
         )
@@ -472,6 +480,8 @@ def send_webhook_alert_hits(
                 user_webhook.pk,
                 alert.pk,
             )
+            webhook_sent = True
+    return webhook_sent
 
 
 @app.task(ignore_result=True)
@@ -499,14 +509,11 @@ def send_search_alert_emails(
             continue
 
         subject = build_alert_email_subject(hits)
-        alert_user: UserProfile.user = User.objects.get(pk=user_id)
+        alert_user = User.objects.get(pk=user_id)
         context = {
             "hits": hits,
             "hits_limit": settings.SCHEDULED_ALERT_HITS_LIMIT,
             "scheduled_alert": scheduled_alert,
-            "recap_alerts_banner": switch_is_active(
-                "recap-alerts-email-banner"
-            ),
         }
         headers = {}
         query_string = ""
@@ -543,16 +550,39 @@ def send_search_alert_emails(
 @retry(IntegrityError, tries=3, delay=0.5, backoff=1)
 def create_schedule_alerts_hits_in_bulk(
     scheduled_hits: list[ScheduledAlertHit],
-) -> None:
+) -> int:
     """Create ScheduledAlertHit records in bulk.
 
-    Uses bulk_create to persist a list of ScheduledAlertHit instances in a
-    single database operation. Do retries upon IntegrityError.
+    Hits whose Alert no longer exists are dropped, since a user can delete an
+    alert between the moment it is matched and the moment its hits are written,
+    which would otherwise raise an FK IntegrityError for the whole batch.
+
+    Rows are inserted in batches of settings.SCHEDULED_ALERT_HIT_BATCH_SIZE to
+    bound the memory psycopg uses while building each INSERT. bulk_create wraps
+    a multi-batch insert in its own transaction, so the IntegrityError retry
+    cannot re-insert batches that already committed.
 
     :param scheduled_hits: A list of ScheduledAlertHit instances to be created.
-    :return: None
+    :return: The number of ScheduledAlertHit records created.
     """
-    ScheduledAlertHit.objects.bulk_create(scheduled_hits)
+    if not scheduled_hits:
+        return 0
+
+    existing_alert_ids = set(
+        Alert.objects.filter(
+            pk__in={hit.alert_id for hit in scheduled_hits}
+        ).values_list("pk", flat=True)
+    )
+    hits_to_create = [
+        hit for hit in scheduled_hits if hit.alert_id in existing_alert_ids
+    ]
+    if not hits_to_create:
+        return 0
+
+    ScheduledAlertHit.objects.bulk_create(
+        hits_to_create, batch_size=settings.SCHEDULED_ALERT_HIT_BATCH_SIZE
+    )
+    return len(hits_to_create)
 
 
 @app.task(ignore_result=True)
@@ -582,7 +612,6 @@ def percolator_response_processing(response: SendAlertsResponse) -> None:
     r = get_redis_interface("CACHE")
     recap_document_hits = [hit.id for hit in rd_alerts_triggered]
     docket_hits = [hit.id for hit in d_alerts_triggered]
-    alerts_triggered_ids = []
     for hit in main_alerts_triggered:
         # Create a deep copy of the original 'document_content' to allow
         # independent highlighting for each alert triggered.
@@ -607,12 +636,14 @@ def percolator_response_processing(response: SendAlertsResponse) -> None:
             # Ignore it.
             continue
 
-        alert_user: UserProfile.user = alert_triggered.user
+        alert_user = alert_triggered.user
+        # The (document_type, document_id) pairs to record in the alert_hits
+        # Redis sets if this hit ends up being delivered or scheduled.
+        alert_set_writes: list[tuple[str, int]] = []
         # Set highlight if available in response.
         match app_label_model:
             case "search.RECAPDocument":
-                # Filter out RECAPDocuments and set the document id to the
-                # Redis RECAPDocument alert hits set.
+                # Filter out RECAPDocuments already seen by this alert.
                 if not include_recap_document_hit(
                     alert_triggered_id, recap_document_hits, docket_hits
                 ) or has_document_alert_hit_been_triggered(
@@ -622,18 +653,15 @@ def percolator_response_processing(response: SendAlertsResponse) -> None:
                 transform_percolator_child_document(
                     document_content_copy, hit.meta
                 )
-                add_document_hit_to_alert_set(
-                    r, alert_triggered_id, "r", document_content_copy["id"]
-                )
                 object_id = document_content_copy["docket_id"]
-                # Mark case-only alert as triggered.
-                add_document_hit_to_alert_set(
-                    r, alert_triggered_id, "co", object_id
-                )
                 child_document = True
+                alert_set_writes = [
+                    ("r", document_content_copy["id"]),
+                    # Mark case-only alert as triggered.
+                    ("co", object_id),
+                ]
             case "search.Docket":
-                # Filter out Dockets and set the document id to the
-                # Redis Docket alert hits set.
+                # Filter out Dockets already seen by this alert.
                 if has_document_alert_hit_been_triggered(
                     r,
                     alert_triggered_id,
@@ -641,24 +669,18 @@ def percolator_response_processing(response: SendAlertsResponse) -> None:
                     document_content_copy["docket_id"],
                 ):
                     continue
-                add_document_hit_to_alert_set(
-                    r,
-                    alert_triggered_id,
-                    "d",
-                    document_content_copy["docket_id"],
-                )
                 object_id = document_content_copy["docket_id"]
-                # Mark case-only alert as triggered.
-                add_document_hit_to_alert_set(
-                    r, alert_triggered_id, "co", object_id
-                )
                 child_document = False
+                alert_set_writes = [
+                    ("d", object_id),
+                    # Mark case-only alert as triggered.
+                    ("co", object_id),
+                ]
             case "audio.Audio":
                 object_id = document_content_copy["id"]
                 child_document = False
             case "search.Opinion":
-                # Filter out Opinions and set the document id to the
-                # Redis Opinion alert hits set.
+                # Filter out Opinions already seen by this alert.
                 if has_document_alert_hit_been_triggered(
                     r, alert_triggered_id, "o", document_content_copy["id"]
                 ):
@@ -666,11 +688,9 @@ def percolator_response_processing(response: SendAlertsResponse) -> None:
                 transform_percolator_child_document(
                     document_content_copy, hit.meta
                 )
-                add_document_hit_to_alert_set(
-                    r, alert_triggered_id, "o", document_content_copy["id"]
-                )
                 object_id = document_content_copy["cluster_id"]
                 child_document = True
+                alert_set_writes = [("o", document_content_copy["id"])]
             case _:
                 raise NotImplementedError(
                     "Percolator response processing not supported for: %s",
@@ -699,11 +719,21 @@ def percolator_response_processing(response: SendAlertsResponse) -> None:
         ]
         # Send real time Webhooks for all users regardless of alert rate and
         # user's donations.
-        send_webhook_alert_hits(alert_user, hits)
-        if (
+        webhook_sent = send_webhook_alert_hits(alert_user, hits)
+        schedule_alert = not (
             alert_triggered.rate == Alert.REAL_TIME
-            and not alert_user.profile.is_eligible_for_rt_search_alerts
-        ):
+            and not alert_user.profile.is_eligible_for_rt_search_alerts  # pyrefly:ignore[missing-attribute]
+        )
+        # Only record the hit in the alert_hits Redis sets if the alert was
+        # actually delivered (webhook) or will be scheduled (email).
+        # Otherwise, the sets grow unbounded for overly broad non-member RT
+        # alerts that have no active webhooks.
+        if webhook_sent or schedule_alert:
+            for document_type, document_id in alert_set_writes:
+                add_document_hit_to_alert_set(
+                    r, alert_triggered_id, document_type, document_id
+                )
+        if not schedule_alert:
             # Omit scheduling an RT alert if the user is not a member.
             continue
         # Schedule RT, DAILY, WEEKLY and MONTHLY Alerts
@@ -727,22 +757,9 @@ def percolator_response_processing(response: SendAlertsResponse) -> None:
                 object_id=object_id,
             )
         )
-        alerts_triggered_ids.append(alert_triggered_id)
 
-    # Filter out scheduled_hits_to_create by alerts that still exist in the
-    # database to prevent an IntegrityError caused by a race condition when
-    # an alert is deleted.
-    existing_ids = set(
-        Alert.objects.filter(pk__in=alerts_triggered_ids).values_list(
-            "pk", flat=True
-        )
-    )
-    scheduled_hits_to_create_filtered = [
-        hit for hit in scheduled_hits_to_create if hit.alert_id in existing_ids
-    ]
     # Create scheduled RT, DAILY, WEEKLY and MONTHLY Alerts in bulk.
-    if scheduled_hits_to_create_filtered:
-        create_schedule_alerts_hits_in_bulk(scheduled_hits_to_create_filtered)
+    create_schedule_alerts_hits_in_bulk(scheduled_hits_to_create)
 
 
 @app.task(
@@ -916,3 +933,24 @@ def es_save_alert_document(
     )
     if doc_indexed not in ["created", "updated"]:
         logger.warning("Error indexing Alert ID %s:", alert.pk)
+
+
+@app.task(
+    bind=True,
+    autoretry_for=(RedisConnectionError,),
+    max_retries=3,
+    interval_start=5,
+    ignore_result=True,
+)
+def remove_alert_hits_set_task(self: Task, alert_id: int) -> None:
+    """Remove every Redis SET storing document hits for a deleted alert.
+
+    This runs the cleanup in a worker so it doesn't block the request that
+    deleted the Alert, and so a transient Redis ``ConnectionError`` is retried.
+
+    :param self: The celery task.
+    :param alert_id: The ID of the deleted Alert whose hit sets to remove.
+    :return: None
+    """
+    r = get_redis_interface("CACHE")
+    remove_alert_hits_set(r, alert_id)

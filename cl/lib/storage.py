@@ -2,10 +2,20 @@ import itertools
 import os
 import uuid
 
+from asgiref.sync import sync_to_async
 from django.conf import settings
+from django.core.files.base import File
 from django.core.files.storage import Storage
 from storages.backends.s3 import S3ManifestStaticStorage, S3Storage
 from storages.backends.s3boto3 import S3Boto3Storage
+
+
+@sync_to_async
+def read_file_bytes(file: File) -> bytes:
+    """Read a Django file in binary mode and close it."""
+    with file:
+        file.open(mode="rb")
+        return file.read()
 
 
 def clobbering_get_name(
@@ -59,6 +69,8 @@ class AWSMediaStorage(S3Storage):
 
     location = ""
     file_overwrite = True
+    # Populated by django-storages from AWS_S3_OBJECT_PARAMETERS.
+    object_parameters: dict[str, str]
 
     def get_object_parameters(self, name: str) -> dict[str, str]:
         # Set extremely long caches b/c we hash our content anyway
@@ -143,6 +155,8 @@ class S3GlacierInstantRetrievalStorage(S3Storage):
     default_acl = "private"
     bucket_name = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
     file_overwrite = True
+    # Populated by django-storages from AWS_S3_OBJECT_PARAMETERS.
+    object_parameters: dict[str, str]
 
     def __init__(self, naming_strategy=get_name_by_incrementing, **settings):
         self.naming_strategy = naming_strategy
@@ -176,6 +190,8 @@ class S3IntelligentTieringStorage(S3Storage):
 
     location = ""
     file_overwrite = True
+    # Populated by django-storages from AWS_S3_OBJECT_PARAMETERS.
+    object_parameters: dict[str, str]
 
     def get_object_parameters(self, name: str) -> dict[str, str]:
         params = self.object_parameters.copy()

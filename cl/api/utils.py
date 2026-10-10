@@ -8,6 +8,7 @@ from itertools import batched, chain
 from typing import Any, TypedDict
 
 import eyecite
+from asgiref.sync import async_to_sync, sync_to_async
 from celery import chain as celery_chain
 from dateutil import parser
 from dateutil.rrule import DAILY, rrule
@@ -27,7 +28,6 @@ from django.utils.functional import cached_property
 from django.utils.timezone import now
 from django.views.decorators.cache import cache_page
 from django.views.decorators.vary import vary_on_headers
-from django_ratelimit.core import get_header
 from eyecite.tokenizers import HyperscanTokenizer
 from requests import Response
 from rest_framework import serializers
@@ -36,13 +36,13 @@ from rest_framework.metadata import SimpleMetadata
 from rest_framework.permissions import DjangoModelPermissions
 from rest_framework.request import clone_request
 from rest_framework.response import Response as DRFResponse
-from rest_framework.throttling import UserRateThrottle
+from rest_framework.throttling import AnonRateThrottle, UserRateThrottle
 from rest_framework_filters import FilterSet, RelatedFilter
 from rest_framework_filters.backends import RestFrameworkFilterBackend
 from rest_framework_filters.filterset import related
 from waffle import switch_is_active
 
-from cl.api.constants import LEVEL_TO_RATES, SYNC_MEMBERSHIP_THROTTLES_SWITCH
+from cl.api.constants import LEVEL_TO_RATES
 from cl.api.models import (
     WEBHOOK_EVENT_STATUS,
     APIThrottle,
@@ -53,8 +53,15 @@ from cl.api.models import (
     WebhookVersions,
 )
 from cl.citations.utils import filter_out_non_case_law_and_non_valid_citations
-from cl.donate.models import MembershipPaymentStatus, NeonMembership
+from cl.donate.models import (
+    NeonMembership,
+    NeonMembershipLevel,
+)
 from cl.lib.decorators import clear_tiered_cache, tiered_cache
+from cl.lib.ratelimiter import (
+    get_ratelimit_ident,
+    parse_rate,
+)
 from cl.lib.redis_utils import get_redis_interface
 from cl.stats.constants import StatMetric, StatWebhookEventType
 from cl.stats.models import Event
@@ -99,10 +106,7 @@ BASIC_TEXT_LOOKUPS = [
     "iexact",
     "startswith",
     "istartswith",
-    "endswith",
-    "iendswith",
 ]
-ALL_TEXT_LOOKUPS = BASIC_TEXT_LOOKUPS + ["contains", "icontains"]
 
 logger = logging.getLogger(__name__)
 
@@ -546,9 +550,7 @@ class LoggingMixin:
     def _log_request(self, request):
         d = date.today().isoformat()
         user = request.user
-        client_ip = get_header(request, "CloudFront-Viewer-Address").split(
-            ":"
-        )[0]
+        client_ip = get_ratelimit_ident(request)
         endpoint = resolve(request.path_info).url_name
         response_ms = self._get_response_ms()
 
@@ -742,19 +744,23 @@ class NoFilterCacheListMixin:
         return response
 
 
-@tiered_cache(timeout=300)  # 5 minute cache
+@tiered_cache(memory_timeout=60, redis_timeout=300)
 def get_all_throttle_overrides(
     throttle_type: int,
 ) -> dict[str, list[str]]:
-    """Get all throttle overrides of a given type, cached for 5 minutes.
+    """Get all throttle overrides of a given type, cached in both tiers.
+
+    Overrides are cached for 5 minutes in Redis and 1 minute in memory, so an
+    override change made in one process reaches the others within a minute of
+    the Redis entry being refreshed.
 
     Throttle rates are composed from two sources:
 
     - MANUAL overrides always apply.
     - MEMBERSHIP overrides apply only if the user's NeonMembership is active
-      (payment_status=SUCCEEDED and termination_date is null or in the future),
-      and no MANUAL overrides exist. If any MANUAL overrides are present, they
-      fully replace the MEMBERSHIP set.
+      (payment_status in ACTIVE_PAYMENT_STATUSES and termination_date is null
+      or in the future), and no MANUAL overrides exist. If any MANUAL overrides
+      are present, they fully replace the MEMBERSHIP set.
 
     :param throttle_type: The ThrottleType integer value (API or CITATION_LOOKUP).
     :return: Dictionary mapping username to a list of rate strings. A list
@@ -769,7 +775,7 @@ def get_all_throttle_overrides(
     today = now().date()
     active_member_ids = (
         NeonMembership.objects.filter(
-            payment_status=MembershipPaymentStatus.SUCCEEDED,
+            payment_status__in=NeonMembership.ACTIVE_PAYMENT_STATUSES,
         )
         .filter(
             Q(termination_date__isnull=True)
@@ -800,7 +806,77 @@ def get_all_throttle_overrides(
     return overrides
 
 
-def apply_membership_throttles(user: User, level: int) -> bool:
+# Temporary: membership-promotion x2 API boost. Remove this
+# block and its call sites when the promo ends.
+DOUBLE_API_THROTTLES_SWITCH = "double_api_throttles"
+
+
+def double_rate(rate: str) -> str:
+    """Return a DRF rate string with its request count doubled.
+
+    Example:
+        "10/min" -> "20/min"
+    """
+    num, _, period = rate.partition("/")
+    return f"{int(num) * 2}/{period}"
+
+
+@tiered_cache(memory_timeout=60, redis_timeout=300)
+def get_promo_excluded_usernames() -> set[str]:
+    """Return usernames excluded from the x2 API promotion.
+
+    Excluded users:
+    - Users with a manual/commercial API throttle override.
+    - Active EDU members.
+
+    All other authenticated users (paid members, LSO members, and
+    non-members) receive doubled API limits while the promotion switch is
+    enabled.
+    """
+    manual_users = set(
+        APIThrottle.objects.filter(
+            throttle_type=ThrottleType.API,
+            source=APIThrottle.Source.MANUAL,
+        ).values_list("user__username", flat=True)
+    )
+    today = now().date()
+    edu_members = set(
+        NeonMembership.objects.filter(
+            payment_status__in=NeonMembership.ACTIVE_PAYMENT_STATUSES,
+            level=NeonMembershipLevel.EDU,
+        )
+        .filter(
+            Q(termination_date__isnull=True)
+            | Q(termination_date__date__gte=today)
+        )
+        .values_list("user__username", flat=True)
+    )
+    return manual_users | edu_members
+
+
+@tiered_cache(memory_timeout=60, redis_timeout=600)
+def promo_switch_is_active() -> bool:
+    """Whether the promo switch is on.
+
+    Cached via tiered_cache so we avoid a waffle lookup on every API
+    request. A flip takes up to the redis tier timeout to take
+    effect, which is acceptable for enabling/disabling the promotion.
+    """
+    return switch_is_active(DOUBLE_API_THROTTLES_SWITCH)
+
+
+def promo_doubling_applies(user: User) -> bool:
+    """Return whether the x2 API promotion applies to this user."""
+    if not promo_switch_is_active():
+        return False
+    if not user.is_authenticated:
+        return False
+    return user.username not in get_promo_excluded_usernames()
+
+
+def apply_membership_throttles(
+    user: User, level: int, clear_cache: bool = False
+) -> bool:
     """
     Sync a user's MEMBERSHIP-based API throttles to match the given membership level.
 
@@ -814,16 +890,20 @@ def apply_membership_throttles(user: User, level: int) -> bool:
     - Existing MEMBERSHIP throttles are fully removed before new ones are created.
 
     This function is a no-op when:
-    - The `SYNC_MEMBERSHIP_THROTTLES_SWITCH` feature flag is disabled
     - The provided `level` does not exist in `LEVEL_TO_RATES`
       (e.g., unsupported, legacy, or commercial levels)
+
+    Args:
+        user: The user whose throttles are being synced.
+        level: The Neon membership level to map to a set of rates.
+        clear_cache: When True, call ``clear_tiered_cache()`` after writing
+            the new throttle rows. Defaults to False, allowing batch callers
+            to defer cache clearing until after a loop and avoid repeated
+            invalidations on each iteration.
 
     Returns:
         bool: True if throttles were successfully applied, False if skipped.
     """
-    if not switch_is_active(SYNC_MEMBERSHIP_THROTTLES_SWITCH):
-        return False
-
     rates = LEVEL_TO_RATES.get(level)
     if rates is None:
         logger.info(
@@ -847,18 +927,17 @@ def apply_membership_throttles(user: User, level: int) -> bool:
                 source=APIThrottle.Source.MEMBERSHIP,
                 notes=f"Set by Neon membership level={level}.",
             )
-    clear_tiered_cache()
+
+    if clear_cache:
+        clear_tiered_cache()
     return True
 
 
 def clear_membership_throttles(user: User) -> None:
     """Delete the user's MEMBERSHIP-source API throttle rows.
 
-    MANUAL rows are never touched. No-op when the
-    SYNC_MEMBERSHIP_THROTTLES_SWITCH waffle switch is off.
+    MANUAL rows are never touched.
     """
-    if not switch_is_active(SYNC_MEMBERSHIP_THROTTLES_SWITCH):
-        return
     deleted, _ = APIThrottle.objects.filter(
         user=user,
         throttle_type=ThrottleType.API,
@@ -866,10 +945,6 @@ def clear_membership_throttles(user: User) -> None:
     ).delete()
     if deleted:
         clear_tiered_cache()
-
-
-USE_NEW_THROTTLE_DEFAULTS_SWITCH = "use_new_throttle_defaults"
-LEGACY_USER_DEFAULT_RATE = "5000/hour"
 
 
 def get_recent_api_request_count(user: User, window_seconds: int) -> int:
@@ -882,18 +957,259 @@ def get_recent_api_request_count(user: User, window_seconds: int) -> int:
     that returns an accurate count.
     """
     key = UserRateThrottle.cache_format % {"scope": "user", "ident": user.pk}
+    if promo_doubling_applies(user):
+        key = f"{key}_promo2x"
     history: list[float] = default_cache.get(key, [])
     cutoff = time.time() - window_seconds
     return sum(1 for ts in history if ts > cutoff)
 
 
-class TagRateThrottle(UserRateThrottle):
+class ThrottleUsageRow(TypedDict):
+    """Current usage information for a single throttle rate window."""
+
+    scope: str
+    rate: str
+    used: int
+    limit: int
+    remaining: int
+    window_seconds: int
+    reset_at: str | None
+    blocked: bool
+
+
+def _coerce_rate_list(raw: str | list[str] | None) -> list[str]:
+    """Return a throttle rate configuration as a list of rate strings."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return [raw]
+    return list(raw)
+
+
+def _effective_rates(
+    throttle_type: ThrottleType,
+    username: str,
+    default_rates: dict[str, str | list[str]],
+    default_scope: str,
+) -> list[str]:
+    """Return the effective rate list for a user's throttle type."""
+    return get_all_throttle_overrides(throttle_type).get(
+        username
+    ) or _coerce_rate_list(default_rates.get(default_scope))
+
+
+def _next_available_at(
+    in_window: list[tuple[int, float]],
+    used: int,
+    limit: int,
+    duration: int,
+) -> float | None:
+    """When the window will next admit a request that it won't admit now.
+
+    This function calculates the earliest time at which a new request can be
+    accommodated in the throttle window, considering the current usage and
+    the limit.
+
+    :param in_window: ``(weight, timestamp)`` entries inside the rate window.
+    :param used: Total weight currently in the window.
+    :param limit: Requests (or citations) the rate allows per window.
+    :param duration: Window length in seconds.
+    :return: Unix timestamp, or None if no expiry would admit a request.
+    """
+    if not in_window or limit == 0:
+        # A '0/...' rate blocks outright; no amount of expiry admits anything.
+        return None
+
+    # Weight that must expire before the next request fits: enforcement admits
+    # a request while used < limit. Clamped at 1 because under the limit the
+    # next request already fits, and the oldest entry leaving the window is
+    # simply when capacity next grows.
+    needed = max(used - limit + 1, 1)
+
+    expiry: float | None = None
+    expired = 0
+    for weight, timestamp in sorted(in_window, key=lambda entry: entry[1]):
+        # An oversized entry occupies proportionally more of the window, so it
+        # holds its slot proportionally longer — matches throttle_request.
+        expiry = timestamp + max(weight / limit, 1) * duration
+        expired += weight
+        if expired >= needed:
+            break
+    # Exhausting the loop means even a drained window can't fit the request;
+    # enforcement reports the newest entry's scaled expiry, so return that.
+    return expiry
+
+
+def _build_usage_rows(
+    scope: str,
+    rates: list[str],
+    now: float,
+    weighted_history: list[tuple[int, float]],
+) -> list[ThrottleUsageRow]:
+    """Build throttle usage rows for a scope from cached request history.
+
+    History contains ``(weight, timestamp)`` pairs, where the weight is one
+    request for API throttles or the citation count for citation throttles.
+    """
+    usage_rows: list[ThrottleUsageRow] = []
+    for rate in rates:
+        limit, duration = parse_rate(rate)
+        cutoff = now - duration
+        in_window = [(w, ts) for w, ts in weighted_history if ts > cutoff]
+        used = sum(w for w, _ in in_window)
+
+        next_at = _next_available_at(in_window, used, limit, duration)
+        reset_at = (
+            None
+            if next_at is None
+            else datetime.fromtimestamp(next_at, tz=UTC).isoformat()
+        )
+
+        usage_rows.append(
+            {
+                "scope": scope,
+                "rate": rate,
+                "used": used,
+                "limit": limit,
+                "remaining": max(limit - used, 0),
+                "window_seconds": duration,
+                "reset_at": reset_at,
+                "blocked": limit == 0,
+            }
+        )
+    return usage_rows
+
+
+def get_current_throttle_usage(user: User) -> list[ThrottleUsageRow]:
+    """Per-(scope, rate) live throttle usage for an authenticated user.
+
+    Covers the "user" (API), "citations", and "fetch" scopes. Mirrors
+    enforcement exactly: effective rates come from
+    ``get_all_throttle_overrides`` (MANUAL/MEMBERSHIP precedence + membership
+    expiry honored), falling back to ``DEFAULT_THROTTLE_RATES``; the x2 promo
+    is applied to the API scope when it applies to this user; counts come from
+    the same cache keys the throttles write to. One row per rate, so
+    multidimensional limits are fully reported. The dedicated ``api_usage``
+    scope that governs this endpoint is included too; it is never overridden,
+    so it always reports the default rates.
+    """
+    default_rates = settings.REST_FRAMEWORK["DEFAULT_THROTTLE_RATES"]  # type: ignore[misc]
+    username = user.username
+    now = time.time()
+    usage_rows: list[ThrottleUsageRow] = []
+
+    # --- API scope ("user"): one timestamp per request -----------------
+    api_rates = _effective_rates(
+        ThrottleType.API, username, default_rates, "user"
+    )
+    api_key = f"throttle_user_{user.pk}"
+    if promo_doubling_applies(user):
+        api_rates = [double_rate(r) for r in api_rates]
+        api_key = f"{api_key}_promo2x"
+    api_history: list[float] = default_cache.get(api_key, [])
+    usage_rows += _build_usage_rows(
+        "user", api_rates, now, [(1, ts) for ts in api_history]
+    )
+
+    # --- Citations scope: history is [citation_count, timestamp] -------
+    citation_rates = _effective_rates(
+        ThrottleType.CITATION_LOOKUP, username, default_rates, "citations"
+    )
+    citation_history: list[tuple[int, float]] = default_cache.get(
+        f"throttle_citations_{user.pk}", []
+    )
+    usage_rows += _build_usage_rows(
+        "citations",
+        citation_rates,
+        now,
+        [(count, ts) for count, ts in citation_history],
+    )
+
+    # --- API usage scope: this endpoint's own limit -------------------
+    api_usage_rates = _coerce_rate_list(default_rates.get("api_usage"))
+    api_usage_history: list[float] = default_cache.get(
+        f"throttle_api_usage_{user.pk}", []
+    )
+    usage_rows += _build_usage_rows(
+        "api_usage",
+        api_usage_rates,
+        now,
+        [(1, ts) for ts in api_usage_history],
+    )
+
+    # --- Fetch scope ("fetch"): one timestamp per request ---------------
+    # No promo doubling here: the x2 promo only ever applies to "user".
+    fetch_rates = _effective_rates(
+        ThrottleType.RECAP_FETCH, username, default_rates, "fetch"
+    )
+    fetch_history: list[float] = default_cache.get(
+        f"throttle_fetch_{user.pk}", []
+    )
+    usage_rows += _build_usage_rows(
+        "fetch", fetch_rates, now, [(1, ts) for ts in fetch_history]
+    )
+
+    # Limit closest to being hit first; blocked rows float to the top.
+    usage_rows.sort(
+        key=lambda r: (
+            1.0
+            if r["blocked"]
+            else (r["used"] / r["limit"] if r["limit"] else 0.0)
+        ),
+        reverse=True,
+    )
+    return usage_rows
+
+
+class CloudFrontIdentMixin:
+    """Identify anonymous clients by the address CloudFront saw.
+
+    DRF identifies an anonymous client from X-Forwarded-For or REMOTE_ADDR.
+    Neither is stable behind our CDN: the same client arrives with a different
+    ident from request to request, so its requests scatter across throttle
+    buckets and the limit stops holding — some requests sail through while
+    others are refused, with wildly different retry times (#7655).
+
+    CloudFront-Viewer-Address carries the viewer's real address, which is what
+    the rest of the codebase already counts by. Requests without the header
+    (local development, tests) fall back to DRF's behavior.
+    """
+
+    def get_ident(self, request):
+        return get_ratelimit_ident(request) or super().get_ident(request)
+
+
+class CloudFrontAnonRateThrottle(CloudFrontIdentMixin, AnonRateThrottle):
+    """The anonymous rate limit, keyed on the viewer's real address."""
+
+
+class TagRateThrottle(CloudFrontIdentMixin, UserRateThrottle):
     """Higher dedicated rate limit for the tag endpoints."""
 
     scope = "tags"
 
 
-class ExceptionalUserRateThrottle(UserRateThrottle):
+class EventCounterThrottle(CloudFrontIdentMixin, UserRateThrottle):
+    """Throttles increment-event"""
+
+    scope = "events"
+
+
+def has_throttle_override(user: User, throttle_type: int) -> bool:
+    """Whether the user has an active throttle override of the given type.
+
+    Uses the same source of truth as the throttles themselves
+    (``get_all_throttle_overrides``), so MANUAL/MEMBERSHIP precedence and
+    membership expiry are honored.
+
+    :param user: The user to check.
+    :param throttle_type: The ThrottleType integer value.
+    :return: True if the user has an active override of that type.
+    """
+    return user.username in get_all_throttle_overrides(throttle_type)
+
+
+class ExceptionalUserRateThrottle(CloudFrontIdentMixin, UserRateThrottle):
     """User rate throttle that supports multiple simultaneous rate limits.
 
     Reads per-user overrides from the APIThrottle table. Blocking is expressed
@@ -901,17 +1217,11 @@ class ExceptionalUserRateThrottle(UserRateThrottle):
     `count >= num_requests` with num_requests=0 is always true.
     """
 
+    # The APIThrottle type whose per-user overrides this throttle reads.
+    throttle_type = ThrottleType.API
+
     def __init__(self):
         raw = self.THROTTLE_RATES.get(self.scope)
-        # Until we're ready to roll out the multi-rate user defaults
-        # configured in settings (issue #7196), keep the historical
-        # 5000/hour fallback for the "user" scope. Other scopes (e.g.
-        # the "citations" rate read separately by CitationCountRateThrottle
-        # in get_citations_rate) read settings as before.
-        if self.scope == "user" and not switch_is_active(
-            USE_NEW_THROTTLE_DEFAULTS_SWITCH
-        ):
-            raw = LEGACY_USER_DEFAULT_RATE
         if raw is None:
             self.rate = None
             self.default_rates: list[str] = []
@@ -926,6 +1236,32 @@ class ExceptionalUserRateThrottle(UserRateThrottle):
         if self.rate is not None:
             self.num_requests, self.duration = self.parse_rate(self.rate)
 
+    def _promo_applies(self, request) -> bool:
+        """Whether the x2 promo applies to this user-scope request."""
+        return self.scope == "user" and promo_doubling_applies(request.user)
+
+    def get_cache_key(self, request, view):
+        key = super().get_cache_key(request, view)
+        if key is None:
+            return None
+        # Promo: isolate doubled-quota usage so reverting to base rates at
+        # promo end doesn't count it against the smaller window.
+        if self._promo_applies(request):
+            return f"{key}_promo2x"
+        return key
+
+    def get_effective_rates(self, request) -> list[str]:
+        """The rates to enforce for this request.
+
+        Per-user ``APIThrottle`` overrides win over the scope defaults, with
+        the x2 promo applied on top when it applies.
+        """
+        overrides = get_all_throttle_overrides(self.throttle_type)
+        rates = overrides.get(request.user.username) or self.default_rates
+        if self._promo_applies(request):
+            rates = [double_rate(r) for r in rates]
+        return rates
+
     def allow_request(self, request, view):
         if self.rate is None:
             return True
@@ -937,9 +1273,7 @@ class ExceptionalUserRateThrottle(UserRateThrottle):
         self.history = self.cache.get(self.key, [])
         self.now = self.timer()
 
-        overrides = get_all_throttle_overrides(ThrottleType.API)
-        rates = overrides.get(request.user.username) or self.default_rates
-        return self._check_multi_rate(rates)
+        return self._check_multi_rate(self.get_effective_rates(request))
 
     def _check_multi_rate(self, rates: list[str]) -> bool:
         """Enforce multiple rate windows against one shared timestamp history.
@@ -1028,6 +1362,60 @@ class ExceptionalUserRateThrottle(UserRateThrottle):
                 f"{self.failing_rate}."
             )
         raise Throttled(wait=wait, detail=detail)
+
+
+class AlertThrottle(ExceptionalUserRateThrottle):
+    """Per-user throttle for the search alerts endpoint (scope 'alerts').
+
+    Unlike the global user throttle, this scope has no default rate, so it
+    never throttles regular users: members and non-members create alerts
+    bounded by their membership quota (see ``check_alert_limits``) and the
+    global user throttle. Only users with a commercial agreement, configured
+    via an ``APIThrottle`` row of type ALERTS, are throttled here at their
+    configured rate, and those same users bypass the membership quota.
+
+    ``SearchAlertViewSet.get_throttles`` wires this throttle in only for
+    commercial users' write requests (POST/PUT/PATCH), as the sole throttle
+    for those requests. That way commercial alert writes run at the configured
+    rate instead of being capped by the global per-user API throttle, while
+    their reads still fall back to that global throttle.
+    """
+
+    scope = "alerts"
+    throttle_type = ThrottleType.ALERTS
+
+    def allow_request(self, request, view):
+        if not request.user or not request.user.is_authenticated:
+            return True
+
+        self.key = self.get_cache_key(request, view)
+        if self.key is None:
+            return True
+
+        rates = self.get_effective_rates(request)
+        if not rates:
+            # No commercial alert throttle configured for this user; their
+            # alert creation isn't rate-limited beyond the global throttle.
+            return True
+
+        self.history = self.cache.get(self.key, [])
+        self.now = self.timer()
+        return self._check_multi_rate(rates)
+
+
+class FetchRateThrottle(ExceptionalUserRateThrottle):
+    """Dedicated rate limit for the RECAP Fetch API (scope 'fetch').
+
+    Buying PACER documents via the Fetch API is something CourtListener
+    wants to encourage, so it runs at its own generous default rate instead
+    of being capped by the global per-user API throttle, and that rate
+    applies to every authenticated user regardless of membership status.
+    See #7503. Individual abusive users can still be capped or blocked via
+    a MANUAL ``APIThrottle`` row of this type, same as other scopes.
+    """
+
+    scope = "fetch"
+    throttle_type = ThrottleType.RECAP_FETCH
 
 
 class CitationCountRateThrottle(ExceptionalUserRateThrottle):
@@ -1186,6 +1574,19 @@ class CitationCountRateThrottle(ExceptionalUserRateThrottle):
         )
 
 
+class ApiUsageRateThrottle(ExceptionalUserRateThrottle):
+    """Dedicated throttle for the API usage endpoint (scope 'api_usage').
+
+    Has its own cache key, so monitoring usage never consumes the quota being
+    monitored, and exhausting the API quota never limits this endpoint.
+    """
+
+    scope = "api_usage"
+
+    def get_effective_rates(self, request) -> list[str]:
+        return self.default_rates
+
+
 class RECAPUsersReadOnly(DjangoModelPermissions):
     """Provides access to users with the right permissions.
 
@@ -1330,6 +1731,51 @@ def invert_user_logs(
     return user_keyed_out
 
 
+def get_user_api_usage(
+    user_id: int,
+    start: str | datetime,
+    end: str | datetime,
+) -> dict[str, int]:
+    """Get one user's daily API usage counts over a date range.
+
+    Combines v3 and v4 counts using O(1) ZSCORE lookups against the per-day
+    sorted sets that ``LoggingMixin`` populates, so the cost is independent of
+    how many users hit the API. ``invert_user_logs`` answers the same question
+    by reading every day's set in full, which suits the admin-facing reports
+    but is wasteful for a single user.
+
+    :param user_id: The pk of the user whose usage to look up
+    :param start: Beginning date (inclusive) for the query range
+    :param end: End date (inclusive) for the query range
+    :return: Dictionary mapping ISO dates with usage to their counts, in
+        chronological order, followed by a 'total' key. Dates without usage
+        are omitted; 'total' is always present.
+    """
+    r = get_redis_interface("STATS")
+    pipe = r.pipeline()
+    versions = ["v3", "v4"]
+    dates = make_date_str_list(start, end)
+    for d in dates:
+        for version in versions:
+            # Members are written by zincrby with an int pk, which redis-py
+            # encodes as its decimal string, so an int argument matches. A
+            # mismatch here would read as zero usage rather than erroring.
+            pipe.zscore(f"api:{version}.user.d:{d}.counts", user_id)
+
+    # One score (or None) per version per date, e.g.
+    # [v3_day1, v4_day1, v3_day2, v4_day2, ...].
+    results = pipe.execute()
+
+    out: dict[str, int] = {}
+    total = 0
+    for d, scores in zip(dates, batched(results, len(versions)), strict=True):
+        if count := sum(int(score) for score in scores if score):
+            out[d] = count
+            total += count
+    out["total"] = total
+    return out
+
+
 def get_user_ids_for_date_range(
     start: str | datetime,
     end: str | datetime,
@@ -1432,7 +1878,7 @@ def get_next_webhook_retry_date(retry_counter: int) -> datetime:
 WEBHOOK_MAX_RETRY_COUNTER = 7
 
 
-def check_webhook_failure_count_and_notify(
+async def check_webhook_failure_count_and_notify(
     webhook_event: WebhookEvent,
 ) -> None:
     """Check if a Webhook needs to be disabled and/or send a notification about
@@ -1455,43 +1901,45 @@ def check_webhook_failure_count_and_notify(
         6: False,
         7: True,  # Send webhook disabled notification
     }
-    webhook = webhook_event.webhook
+    webhook = await Webhook.objects.aget(webhook_events=webhook_event)
     if not webhook.enabled or webhook_event.debug:
         return
 
-    webhook.failure_count = F("failure_count") + 1
+    # pyrefly types Django fields by their read type, so it rejects F()
+    # expressions, which Django accepts on assignment.
+    webhook.failure_count = F("failure_count") + 1  # type: ignore[bad-assignment]
     update_fields = ["failure_count"]
 
     current_try_counter = webhook_event.retry_counter
     notify = notify_on[current_try_counter]
     if notify:
-        oldest_enqueued_for_retry = WebhookEvent.objects.filter(
-            webhook=webhook_event.webhook,
+        oldest_enqueued_for_retry = await WebhookEvent.objects.filter(
+            webhook=webhook,
             event_status=WEBHOOK_EVENT_STATUS.ENQUEUED_RETRY,
             debug=False,
-        ).earliest("date_created")
+        ).aearliest("date_created")
         if current_try_counter >= WEBHOOK_MAX_RETRY_COUNTER:
             webhook.enabled = False
             update_fields.append("enabled")
             update_fields.append("date_modified")
             # If the parent webhook is disabled mark all current ENQUEUED_RETRY
             # events as ENDPOINT_DISABLED
-            WebhookEvent.objects.filter(
-                webhook=webhook_event.webhook,
+            await WebhookEvent.objects.filter(
+                webhook=webhook,
                 event_status=WEBHOOK_EVENT_STATUS.ENQUEUED_RETRY,
                 debug=False,
-            ).update(
+            ).aupdate(
                 event_status=WEBHOOK_EVENT_STATUS.ENDPOINT_DISABLED,
                 date_modified=now(),
             )
         if oldest_enqueued_for_retry.pk == webhook_event.pk:
             failure_counter = current_try_counter + 1
-            notify_failing_webhook.delay(
+            await sync_to_async(notify_failing_webhook.delay)(
                 webhook_event.pk, failure_counter, webhook.enabled
             )
 
     # Save webhook and avoid emailing admins via signal in cl.users.signals
-    webhook.save(update_fields=update_fields)
+    await webhook.asave(update_fields=update_fields)
 
 
 def update_webhook_event_after_request(
@@ -1535,18 +1983,18 @@ def update_webhook_event_after_request(
         if error is None:
             error = ""
         webhook_event.error_message = error
-        check_webhook_failure_count_and_notify(webhook_event)
+        async_to_sync(check_webhook_failure_count_and_notify)(webhook_event)
         if webhook_event.retry_counter >= WEBHOOK_MAX_RETRY_COUNTER:
             # If the webhook has reached the max retry counter, mark as failed
             webhook_event.event_status = WEBHOOK_EVENT_STATUS.FAILED
-            webhook_event.retry_counter = F("retry_counter") + 1
+            webhook_event.retry_counter = F("retry_counter") + 1  # type: ignore[bad-assignment]
             webhook_event.save()
             return
 
         webhook_event.next_retry_date = get_next_webhook_retry_date(
             webhook_event.retry_counter
         )
-        webhook_event.retry_counter = F("retry_counter") + 1
+        webhook_event.retry_counter = F("retry_counter") + 1  # type: ignore[bad-assignment]
         webhook_event.event_status = WEBHOOK_EVENT_STATUS.ENQUEUED_RETRY
         if webhook_event.debug:
             # Test events are not enqueued for retry.
@@ -1739,6 +2187,7 @@ class DynamicFieldsMixin:
             allowed = set(filter(None, filter_fields))
 
         # omit fields in the `omit` argument.
+        # TODO: Typing this correctly involves going through a long chain of things that probably also need to be typed
         omitted = set(filter(None, omit_fields))
 
         for field in existing:

@@ -1,7 +1,8 @@
 from collections import defaultdict
 from datetime import datetime, timedelta
 from http import HTTPStatus
-from typing import cast
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
 from unittest import mock
 
 import pytz
@@ -23,6 +24,10 @@ from selenium.webdriver.common.by import By
 from timeout_decorator import timeout_decorator
 from waffle.testutils import override_switch
 
+if TYPE_CHECKING:
+    from django.test.client import _MonkeyPatchedWSGIResponse
+
+from cl.alerts.constants import LEGACY_MEMBERSHIP_HELP_URL
 from cl.alerts.factories import AlertFactory, DocketAlertWithParentsFactory
 from cl.alerts.forms import CreateAlertForm
 from cl.alerts.management.commands.cl_send_scheduled_alerts import (
@@ -44,13 +49,17 @@ from cl.alerts.tasks import (
 )
 from cl.alerts.utils import (
     InvalidDateError,
+    add_document_hit_to_alert_set,
     build_alert_email_subject,
+    fetch_all_search_alerts_results,
+    has_document_alert_hit_been_triggered,
     is_match_all_query,
     percolate_es_document,
 )
-from cl.api.factories import WebhookFactory
+from cl.api.factories import APIThrottleFactory, WebhookFactory
 from cl.api.models import (
     WEBHOOK_EVENT_STATUS,
+    ThrottleType,
     Webhook,
     WebhookEvent,
     WebhookEventType,
@@ -65,6 +74,8 @@ from cl.donate.models import (
 )
 from cl.favorites.factories import NoteFactory, PrayerFactory, UserTagFactory
 from cl.favorites.models import Prayer
+from cl.lib.decorators import clear_tiered_cache
+from cl.lib.redis_utils import get_redis_interface
 from cl.lib.test_helpers import SimpleUserDataMixin
 from cl.people_db.factories import PersonFactory
 from cl.search.documents import (
@@ -80,17 +91,18 @@ from cl.search.factories import (
 )
 from cl.search.models import (
     PRECEDENTIAL_STATUS,
-    Court,
     Docket,
     DocketEntry,
     RECAPDocument,
 )
+from cl.search.types import PercolatorResponses
 from cl.tests.base import SELENIUM_TIMEOUT, BaseSeleniumTest
 from cl.tests.cases import (
     APITestCase,
     ESIndexTestCase,
     MockTallyStatMixin,
     SearchAlertsAssertions,
+    SimpleTestCase,
     TestCase,
 )
 from cl.tests.utils import MockResponse, make_client
@@ -437,13 +449,26 @@ class AlertTest(SimpleUserDataMixin, ESIndexTestCase, TestCase):
         url = reverse("show_results") + f"?type={SEARCH_TYPES.RECAP}"
         r = await self.async_client.post(url, params, follow=True)
         content = r.content.decode()
+        # Legacy members can't upgrade online, so they're routed to the help
+        # page rather than the Neon upgrade flow that 404s for them (#7136).
         self.assert_form_validation_error(
-            "You've used all of the alerts included with your membership.",
+            "You've used all of the alerts included with your legacy membership.",
             content,
         )
-        neon_id = self.user_member.user.membership.neon_id
-        expected_upgrade_url = f"https://donate.free.law/constituent/memberships/upgrade/{neon_id}"
-        self.assertIn(expected_upgrade_url, content)
+        # Scope the link assertions to the validation error itself; the alert
+        # modal always renders a (JS-hidden) upgrade button on every page.
+        validation_error = cast(
+            list[HtmlElement],
+            html.fromstring(content).xpath(
+                '//p[contains(@class, "help-block")]'
+            ),
+        )
+        error_html = html.tostring(validation_error[0], encoding="unicode")
+        self.assertIn(LEGACY_MEMBERSHIP_HELP_URL, error_html)
+        self.assertNotIn(
+            "https://donate.free.law/constituent/memberships/upgrade/",
+            error_html,
+        )
 
         alerts = Alert.objects.filter(user=self.user_member.user)
         self.assertEqual(await alerts.acount(), 0)
@@ -832,13 +857,97 @@ class AlertTest(SimpleUserDataMixin, ESIndexTestCase, TestCase):
         await self.async_client.alogout()
 
 
+@mock.patch(
+    "cl.alerts.utils.get_alerts_set_prefix",
+    return_value="alert_hits_cleanup_test",
+)
+@override_settings(ELASTICSEARCH_DISABLED=True)
+class AlertHitsSetCleanupTest(TestCase):
+    """Are the Redis sets storing an alert's document hits removed when the
+    Alert is deleted?"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.r = get_redis_interface("CACHE")
+        self._clean_redis()
+        self.addCleanup(self._clean_redis)
+
+    def _clean_redis(self) -> None:
+        keys = self.r.keys("alert_hits_cleanup_test:*")
+        if keys:
+            self.r.delete(*keys)
+
+    def test_remove_alert_hits_set_on_alert_deletion(
+        self, mock_prefix
+    ) -> None:
+        """Deleting an Alert should remove every per-document-type Redis set
+        that stored its hits."""
+
+        alert = AlertFactory(
+            rate=Alert.REAL_TIME,
+            name="Test RECAP Alert cleanup",
+            query="docket_number=1:21-bk-1234&type=r",
+            alert_type=SEARCH_TYPES.RECAP,
+        )
+
+        # Simulate hits stored across several document-type sets for this alert.
+        add_document_hit_to_alert_set(self.r, alert.pk, "d", 1)
+        add_document_hit_to_alert_set(self.r, alert.pk, "co", 1)
+        add_document_hit_to_alert_set(self.r, alert.pk, "r", 5)
+
+        # Confirm the sets exist before deletion.
+        self.assertTrue(
+            has_document_alert_hit_been_triggered(self.r, alert.pk, "d", 1)
+        )
+        self.assertTrue(
+            has_document_alert_hit_been_triggered(self.r, alert.pk, "co", 1)
+        )
+        self.assertTrue(
+            has_document_alert_hit_been_triggered(self.r, alert.pk, "r", 5)
+        )
+
+        # Create a set for a different alert to ensure it is not affected.
+        other_alert = AlertFactory(
+            rate=Alert.REAL_TIME,
+            name="Other RECAP Alert",
+            query="docket_number=1:21-bk-9999&type=r",
+            alert_type=SEARCH_TYPES.RECAP,
+        )
+        add_document_hit_to_alert_set(self.r, other_alert.pk, "d", 1)
+
+        alert_pk = alert.pk
+        alert.delete()
+
+        # All sets for the deleted alert should be gone.
+        self.assertEqual(
+            self.r.keys(f"alert_hits_cleanup_test:{alert_pk}.*"),
+            [],
+        )
+        self.assertFalse(
+            has_document_alert_hit_been_triggered(self.r, alert_pk, "d", 1)
+        )
+        self.assertFalse(
+            has_document_alert_hit_been_triggered(self.r, alert_pk, "co", 1)
+        )
+        self.assertFalse(
+            has_document_alert_hit_been_triggered(self.r, alert_pk, "r", 5)
+        )
+
+        # The unrelated alert's set must remain untouched.
+        self.assertTrue(
+            has_document_alert_hit_been_triggered(
+                self.r, other_alert.pk, "d", 1
+            )
+        )
+
+
 class DocketAlertTest(TestCase):
     """Do docket alerts work properly?"""
 
     @classmethod
     def setUpTestData(cls) -> None:
         cls.user = UserFactory()
-        cls.court = Court.objects.get(id="scotus")
+        cls.court = CourtFactory(id="scotus", jurisdiction="F")
 
         # Create a DOCKET_ALERT webhook
         cls.webhook = WebhookFactory(
@@ -921,14 +1030,17 @@ class DocketAlertTest(TestCase):
 
         # Does the webhook was triggered?
         self.assertEqual(webhook_triggered.count(), 1)
-        content = webhook_triggered.first().content
+        webhook_event = webhook_triggered.first()
+        assert webhook_event is not None  # for the type checker
+        content = webhook_event.content
+        assert content is not None  # for the type checker
         # Compare the content of the webhook to the recap document
         pacer_doc_id = content["payload"]["results"][0]["recap_documents"][0][
             "pacer_doc_id"
         ]
         self.assertEqual("232322332", pacer_doc_id)
         self.assertEqual(
-            webhook_triggered.first().event_status,
+            webhook_event.event_status,
             WEBHOOK_EVENT_STATUS.SUCCESSFUL,
         )
 
@@ -1083,16 +1195,45 @@ class AlertAPITests(ESIndexTestCase, APITestCase):
 
     @classmethod
     def setUpTestData(cls) -> None:
-        cls.user_1 = UserFactory()
-        cls.user_2 = UserFactory()
+        # Users need a related UserProfile for the alert quota validation.
+        cls.user_1 = UserProfileWithParentsFactory().user
+        cls.user_2 = UserProfileWithParentsFactory().user
+
+        cls.membership_termination_date = now() + timedelta(days=1)
+        # Non-member used to exercise the free-user quota.
+        cls.no_member_profile = UserProfileWithParentsFactory()
+        cls.user_no_member = cls.no_member_profile.user
+        # Legacy member: RT quota 0, other rates quota 5.
+        cls.user_legacy_member = UserProfileWithParentsFactory().user
+        NeonMembership.objects.create(
+            level=NeonMembershipLevel.LEGACY,
+            user=cls.user_legacy_member,
+            termination_date=cls.membership_termination_date,
+            payment_status=MembershipPaymentStatus.SUCCEEDED,
+        )
+        # Tier 1 member: RT quota 5, other rates quota 10.
+        cls.user_member_tier_1 = UserProfileWithParentsFactory().user
+        NeonMembership.objects.create(
+            level=NeonMembershipLevel.TIER_1,
+            user=cls.user_member_tier_1,
+            termination_date=cls.membership_termination_date,
+            payment_status=MembershipPaymentStatus.SUCCEEDED,
+        )
 
     def setUp(self) -> None:
         self.alert_path = reverse("alert-list", kwargs={"version": "v4"})
         self.client = make_client(self.user_1.pk)
         self.client_2 = make_client(self.user_2.pk)
+        self.client_no_member = make_client(self.user_no_member.pk)
+        self.client_legacy_member = make_client(self.user_legacy_member.pk)
+        self.client_member_tier_1 = make_client(self.user_member_tier_1.pk)
+        # The alert quota and throttle read cached APIThrottle overrides; start
+        # each test with a clean cache so throttle rows don't leak between them.
+        clear_tiered_cache()
 
-    def tearDown(cls):
+    def tearDown(self):
         Alert.objects.all().delete()
+        clear_tiered_cache()
 
     async def make_an_alert(
         self,
@@ -1218,10 +1359,13 @@ class AlertAPITests(ESIndexTestCase, APITestCase):
     def test_alert_update(self) -> None:
         """Can we update an alert?"""
 
+        # Use a member client since the alert is updated to a Real-Time rate,
+        # which is only allowed for members.
+        client = self.client_member_tier_1
         with self.captureOnCommitCallbacks(execute=True):
-            # Make one alerts for user_1
+            # Make one alert for the member user
             alert_1 = async_to_sync(self.make_an_alert)(
-                self.client,
+                client,
                 alert_name="alert_1",
                 alert_query=f"q=testing_query&type={SEARCH_TYPES.ORAL_ARGUMENT}",
             )
@@ -1249,7 +1393,7 @@ class AlertAPITests(ESIndexTestCase, APITestCase):
             "rate": Alert.REAL_TIME,
         }
         with self.captureOnCommitCallbacks(execute=True):
-            response = async_to_sync(self.client.put)(
+            response = async_to_sync(client.put)(
                 alert_1_path_detail, data_updated
             )
 
@@ -1566,6 +1710,511 @@ class AlertAPITests(ESIndexTestCase, APITestCase):
                 self.assertEqual(
                     response.json()["alert_type"], search_type_target
                 )
+
+    async def test_non_member_rt_alert_rejected(self) -> None:
+        """Non-members cannot create Real-Time alerts through the API."""
+        response = await self.make_an_alert(
+            self.client_no_member,
+            alert_query=f"q=testing_query&type={SEARCH_TYPES.OPINION}",
+            alert_rate=Alert.REAL_TIME,
+        )
+        self.assertEqual(response.status_code, HTTPStatus.FORBIDDEN)
+        self.assertIn(
+            "You must be a member to create Real Time alerts.",
+            response.json()["detail"],
+        )
+        self.assertEqual(
+            await Alert.objects.filter(user=self.user_no_member).acount(), 0
+        )
+
+    async def test_member_can_create_rt_non_recap_alert(self) -> None:
+        """Members can create Real-Time non-RECAP alerts through the API."""
+        response = await self.make_an_alert(
+            self.client_member_tier_1,
+            alert_query=f"q=testing_query&type={SEARCH_TYPES.OPINION}",
+            alert_rate=Alert.REAL_TIME,
+        )
+        self.assertEqual(response.status_code, HTTPStatus.CREATED)
+        self.assertEqual(
+            await Alert.objects.filter(user=self.user_member_tier_1).acount(),
+            1,
+        )
+
+    async def test_unlimited_flag_user_can_create_rt_recap_alert(self) -> None:
+        """A non-member with the unlimited alerts flag bypasses the membership
+        and quota restrictions, including for RECAP Real-Time alerts."""
+        self.no_member_profile.unlimited_docket_alerts = True
+        await self.no_member_profile.asave()
+
+        response = await self.make_an_alert(
+            self.client_no_member,
+            alert_query=f"q=testing_query&type={SEARCH_TYPES.RECAP}",
+            alert_rate=Alert.REAL_TIME,
+            alert_type=SEARCH_TYPES.RECAP,
+        )
+        self.assertEqual(response.status_code, HTTPStatus.CREATED)
+        self.assertEqual(response.json()["alert_type"], SEARCH_TYPES.RECAP)
+
+    async def test_free_user_recap_quota_exceeded(self) -> None:
+        """Free users are limited to 5 RECAP/DOCKETS alerts for non-RT rates."""
+        # Fill the quota with 5 DOCKETS DAILY alerts.
+        await sync_to_async(AlertFactory.create_batch)(
+            5,
+            user=self.user_no_member,
+            rate=Alert.DAILY,
+            alert_type=SEARCH_TYPES.DOCKETS,
+        )
+        # The 6th RECAP/DOCKETS alert is rejected.
+        response = await self.make_an_alert(
+            self.client_no_member,
+            alert_query=f"q=testing_query&type={SEARCH_TYPES.RECAP}",
+            alert_rate=Alert.DAILY,
+            alert_type=SEARCH_TYPES.DOCKETS,
+        )
+        self.assertEqual(response.status_code, HTTPStatus.FORBIDDEN)
+        self.assertIn(
+            "To create more than 5 alerts", response.json()["detail"]
+        )
+        self.assertEqual(
+            await Alert.objects.filter(user=self.user_no_member).acount(), 5
+        )
+
+    async def test_non_recap_alerts_dont_count_toward_quota(self) -> None:
+        """Non-RECAP alerts are not subject to the RECAP quota, so a free user
+        can create more than 5 of them."""
+        await sync_to_async(AlertFactory.create_batch)(
+            5,
+            user=self.user_no_member,
+            rate=Alert.DAILY,
+            alert_type=SEARCH_TYPES.OPINION,
+        )
+        response = await self.make_an_alert(
+            self.client_no_member,
+            alert_query=f"q=testing_query&type={SEARCH_TYPES.OPINION}",
+            alert_rate=Alert.DAILY,
+        )
+        self.assertEqual(response.status_code, HTTPStatus.CREATED)
+        self.assertEqual(
+            await Alert.objects.filter(user=self.user_no_member).acount(), 6
+        )
+
+    async def test_legacy_member_recap_rt_rejected(self) -> None:
+        """Legacy members have a RECAP Real-Time quota of 0, so their first
+        RECAP RT alert is rejected with the legacy help message."""
+        response = await self.make_an_alert(
+            self.client_legacy_member,
+            alert_query=f"q=testing_query&type={SEARCH_TYPES.RECAP}",
+            alert_rate=Alert.REAL_TIME,
+            alert_type=SEARCH_TYPES.RECAP,
+        )
+        self.assertEqual(response.status_code, HTTPStatus.FORBIDDEN)
+        detail = response.json()["detail"]
+        # Legacy members can't upgrade online, so they're routed to the help
+        # page rather than the Neon upgrade flow that 404s for them (#7136).
+        self.assertIn(
+            "You've used all of the alerts included with your legacy membership.",
+            detail,
+        )
+        self.assertIn(LEGACY_MEMBERSHIP_HELP_URL, detail)
+        neon_id = await sync_to_async(
+            lambda: self.user_legacy_member.membership.neon_id  # pyrefly:ignore[missing-attribute]
+        )()
+        self.assertNotIn(
+            f"https://donate.free.law/constituent/memberships/upgrade/{neon_id}",
+            detail,
+        )
+        self.assertEqual(
+            await Alert.objects.filter(user=self.user_legacy_member).acount(),
+            0,
+        )
+
+    async def test_member_recap_rt_quota_exceeded(self) -> None:
+        """Tier 1 members have a RECAP Real-Time quota of 5; the 6th RECAP RT
+        alert is rejected."""
+        await sync_to_async(AlertFactory.create_batch)(
+            5,
+            user=self.user_member_tier_1,
+            rate=Alert.REAL_TIME,
+            alert_type=SEARCH_TYPES.DOCKETS,
+        )
+        response = await self.make_an_alert(
+            self.client_member_tier_1,
+            alert_query=f"q=testing_query&type={SEARCH_TYPES.RECAP}",
+            alert_rate=Alert.REAL_TIME,
+            alert_type=SEARCH_TYPES.RECAP,
+        )
+        self.assertEqual(response.status_code, HTTPStatus.FORBIDDEN)
+        self.assertIn(
+            "You've used all of the alerts included with your membership.",
+            response.json()["detail"],
+        )
+        self.assertEqual(
+            await Alert.objects.filter(user=self.user_member_tier_1).acount(),
+            5,
+        )
+
+    async def test_editing_alert_at_quota_excludes_itself(self) -> None:
+        """A user at their quota can still edit an existing RECAP alert, since
+        the alert being edited is excluded from the quota count."""
+        # Fill the free user's non-RT quota with 5 DOCKETS DAILY alerts.
+        alerts = await sync_to_async(AlertFactory.create_batch)(
+            5,
+            user=self.user_no_member,
+            rate=Alert.DAILY,
+            alert_type=SEARCH_TYPES.DOCKETS,
+            query="q=testing_query&type=r",
+        )
+        alert_path_detail = reverse(
+            "alert-detail",
+            kwargs={"pk": alerts[0].pk, "version": "v4"},
+        )
+        # Editing an existing alert while at the quota succeeds because the
+        # alert being edited is excluded from the count.
+        data_updated = {
+            "name": "edited_name",
+            "query": "q=testing_query&type=r",
+            "rate": Alert.DAILY,
+            "alert_type": SEARCH_TYPES.DOCKETS,
+        }
+        response = await self.client_no_member.put(
+            alert_path_detail, data_updated, format="json"
+        )
+        self.assertEqual(response.status_code, HTTPStatus.OK)
+        self.assertEqual(response.json()["name"], "edited_name")
+
+    async def test_alert_frequency_estimation_included_on_success(
+        self,
+    ) -> None:
+        """A successful alert creation includes the alert frequency estimation
+        for the last 100 days in the response."""
+        with mock.patch(
+            "cl.alerts.api_serializers.get_alert_estimation_count",
+            return_value=(250, 0),
+        ):
+            response = await self.make_an_alert(
+                self.client,
+                alert_query=f"q=testing_query&type={SEARCH_TYPES.OPINION}",
+            )
+        self.assertEqual(response.status_code, HTTPStatus.CREATED)
+        self.assertEqual(response.json()["estimated_hits"], 250)
+
+    async def test_alert_rejected_when_query_too_broad(self) -> None:
+        """An alert whose query averages more than MAX_ALERT_RESULTS_PER_DAY
+        hits per day is rejected, and the estimation is surfaced under the same
+        response key."""
+        # 3500 hits / 100 days = 35 hits per day, above the limit of 30.
+        with mock.patch(
+            "cl.alerts.api_serializers.get_alert_estimation_count",
+            return_value=(3500, 0),
+        ):
+            response = await self.make_an_alert(
+                self.client,
+                alert_query=f"q=testing_query&type={SEARCH_TYPES.OPINION}",
+            )
+        self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST)
+        # estimated_hits is returned as an integer, matching the success
+        # response, rather than a list of stringified errors.
+        self.assertEqual(response.json()["estimated_hits"], 3500)
+        self.assertIn("results per day", response.json()["detail"])
+        self.assertEqual(await Alert.objects.all().acount(), 0)
+
+    async def test_alert_rejected_when_query_is_invalid(self) -> None:
+        """An alert whose query can't be validated by SearchForm (so the
+        estimation can't be computed) is rejected with a 400 instead of being
+        silently created."""
+        # cited_gt expects a whole number; "foo" makes SearchForm invalid, so
+        # get_alert_estimation_count returns None.
+        response = await self.make_an_alert(
+            self.client,
+            alert_query=f"q=testing_query&type={SEARCH_TYPES.OPINION}&cited_gt=foo",
+        )
+        self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST)
+        self.assertIn("invalid", str(response.json()["query"]))
+        self.assertEqual(await Alert.objects.all().acount(), 0)
+
+    async def test_alert_rejected_when_query_cant_be_built(self) -> None:
+        """An alert whose query passes SearchForm but can't be built into an ES
+        query (e.g. unbalanced parentheses) is rejected with a 400 carrying the
+        specific reason, instead of being silently created."""
+        response = await self.make_an_alert(
+            self.client,
+            alert_query=f"q=(testing_query&type={SEARCH_TYPES.OPINION}",
+        )
+        self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST)
+        self.assertIn("unbalanced parentheses", str(response.json()["detail"]))
+        self.assertEqual(await Alert.objects.all().acount(), 0)
+
+    async def test_alert_frequency_not_estimated_on_name_only_patch(
+        self,
+    ) -> None:
+        """The estimation only runs when the query is being set; a name-only
+        update doesn't re-run it."""
+        with mock.patch(
+            "cl.alerts.api_serializers.get_alert_estimation_count",
+            return_value=(100, 0),
+        ) as mock_estimation:
+            alert = await self.make_an_alert(
+                self.client,
+                alert_query=f"q=testing_query&type={SEARCH_TYPES.OPINION}",
+            )
+            self.assertEqual(alert.status_code, HTTPStatus.CREATED)
+            self.assertEqual(mock_estimation.call_count, 1)
+
+            alert_path_detail = reverse(
+                "alert-detail",
+                kwargs={"pk": alert.json()["id"], "version": "v4"},
+            )
+            response = await self.client.patch(
+                alert_path_detail, {"name": "edited_name"}
+            )
+            self.assertEqual(response.status_code, HTTPStatus.OK)
+            # The estimation wasn't run again on the name-only update.
+            self.assertEqual(mock_estimation.call_count, 1)
+            self.assertNotIn("estimated_hits", response.json())
+
+    def test_alert_frequency_estimation_real_query(self) -> None:
+        """The estimation is computed from the alert query against ES and
+        returned in the response."""
+        mock_date = timezone.localtime(now()).replace(day=1, hour=5)
+        with (
+            time_machine.travel(mock_date, tick=False),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            opinion = OpinionWithParentsFactory.create(
+                cluster__precedential_status=PRECEDENTIAL_STATUS.PUBLISHED,
+                cluster__case_name="Frequency API Test O",
+                cluster__date_filed=now().date(),
+                plain_text="Lorem dolor",
+            )
+
+        with time_machine.travel(mock_date, tick=False):
+            response = async_to_sync(self.make_an_alert)(
+                self.client,
+                alert_query=f"q=Frequency API Test O&type={SEARCH_TYPES.OPINION}",
+            )
+        self.assertEqual(response.status_code, HTTPStatus.CREATED)
+        self.assertEqual(response.json()["estimated_hits"], 1)
+
+        opinion.cluster.delete()
+
+    async def test_commercial_agreement_bypasses_alert_quota(self) -> None:
+        """A user with a commercial agreement (an ALERTS APIThrottle) bypasses
+        the membership/non-member alert quota and can create more than the free
+        limit of 5 RECAP/DOCKETS alerts."""
+        commercial_user = (
+            await sync_to_async(UserProfileWithParentsFactory)()
+        ).user
+        # Generous rate so the throttle itself doesn't block the 6 creates.
+        await sync_to_async(APIThrottleFactory)(
+            user=commercial_user,
+            throttle_type=ThrottleType.ALERTS,
+            rate="100/min",
+        )
+        await sync_to_async(clear_tiered_cache)()
+        client = await sync_to_async(make_client)(commercial_user.pk)
+
+        with mock.patch(
+            "cl.alerts.api_serializers.get_alert_estimation_count",
+            return_value=(0, 0),
+        ):
+            # Create 6 DOCKETS alerts, one past the free quota of 5.
+            for i in range(6):
+                response = await self.make_an_alert(
+                    client,
+                    alert_name=f"commercial_alert_{i}",
+                    alert_query="q=testing_query&type=r",
+                    alert_type=SEARCH_TYPES.DOCKETS,
+                )
+                self.assertEqual(
+                    response.status_code,
+                    HTTPStatus.CREATED,
+                    msg=f"Alert {i} should have been created.",
+                )
+        self.assertEqual(
+            await Alert.objects.filter(user=commercial_user).acount(), 6
+        )
+
+    async def test_commercial_alert_throttle_rate_limits(self) -> None:
+        """A commercial user's alert creation is rate-limited by their
+        configured ALERTS throttle."""
+        commercial_user = (
+            await sync_to_async(UserProfileWithParentsFactory)()
+        ).user
+        await sync_to_async(APIThrottleFactory)(
+            user=commercial_user,
+            throttle_type=ThrottleType.ALERTS,
+            rate="2/min",
+        )
+        await sync_to_async(clear_tiered_cache)()
+        client = await sync_to_async(make_client)(commercial_user.pk)
+
+        with mock.patch(
+            "cl.alerts.api_serializers.get_alert_estimation_count",
+            return_value=(0, 0),
+        ):
+            # The first two requests fit within the 2/min alert throttle.
+            for i in range(2):
+                response = await self.make_an_alert(
+                    client,
+                    alert_name=f"throttled_alert_{i}",
+                    alert_query="q=testing_query&type=r",
+                    alert_type=SEARCH_TYPES.DOCKETS,
+                )
+                self.assertEqual(response.status_code, HTTPStatus.CREATED)
+
+            # The third request exceeds the alert throttle.
+            response = await self.make_an_alert(
+                client,
+                alert_name="throttled_alert_2",
+                alert_query="q=testing_query&type=r",
+                alert_type=SEARCH_TYPES.DOCKETS,
+            )
+            self.assertEqual(
+                response.status_code, HTTPStatus.TOO_MANY_REQUESTS
+            )
+        self.assertEqual(
+            await Alert.objects.filter(user=commercial_user).acount(), 2
+        )
+
+    async def test_commercial_writes_bypass_global_user_throttle(
+        self,
+    ) -> None:
+        """Commercial alert writes run at the AlertThrottle rate, not the
+        global per-user API throttle.
+
+        The user gets a deliberately tight global API throttle (3/min) on top
+        of a generous ALERTS throttle (100/min). Without the per-method
+        routing in ``SearchAlertViewSet.get_throttles``, the 4th write would be
+        rejected by the global 3/min throttle; with it, only the AlertThrottle
+        applies, so all writes succeed.
+        """
+        commercial_user = (
+            await sync_to_async(UserProfileWithParentsFactory)()
+        ).user
+        # A tight global API throttle that would block writes if it applied.
+        await sync_to_async(APIThrottleFactory)(
+            user=commercial_user,
+            throttle_type=ThrottleType.API,
+            rate="3/min",
+        )
+        # A generous commercial alert throttle.
+        await sync_to_async(APIThrottleFactory)(
+            user=commercial_user,
+            throttle_type=ThrottleType.ALERTS,
+            rate="100/min",
+        )
+        await sync_to_async(clear_tiered_cache)()
+        client = await sync_to_async(make_client)(commercial_user.pk)
+
+        with mock.patch(
+            "cl.alerts.api_serializers.get_alert_estimation_count",
+            return_value=(0, 0),
+        ):
+            # Five writes, well past the global 3/min throttle.
+            for i in range(5):
+                response = await self.make_an_alert(
+                    client,
+                    alert_name=f"bypass_alert_{i}",
+                    alert_query="q=testing_query&type=r",
+                    alert_type=SEARCH_TYPES.DOCKETS,
+                )
+                self.assertEqual(
+                    response.status_code,
+                    HTTPStatus.CREATED,
+                    msg=f"Alert {i} should not be blocked by the global "
+                    "user throttle.",
+                )
+        self.assertEqual(
+            await Alert.objects.filter(user=commercial_user).acount(), 5
+        )
+
+    async def test_non_commercial_writes_keep_global_user_throttle(
+        self,
+    ) -> None:
+        """Non-commercial users are still bound by the global per-user API
+        throttle on the alerts endpoint (the endpoint isn't left unthrottled).
+
+        With a tight 3/min global throttle and no ALERTS override, the 4th
+        write is rejected.
+        """
+        regular_user = (
+            await sync_to_async(UserProfileWithParentsFactory)()
+        ).user
+        await sync_to_async(APIThrottleFactory)(
+            user=regular_user,
+            throttle_type=ThrottleType.API,
+            rate="3/min",
+        )
+        await sync_to_async(clear_tiered_cache)()
+        client = await sync_to_async(make_client)(regular_user.pk)
+
+        with mock.patch(
+            "cl.alerts.api_serializers.get_alert_estimation_count",
+            return_value=(0, 0),
+        ):
+            # The first three writes fit within the global 3/min throttle.
+            for i in range(3):
+                response = await self.make_an_alert(
+                    client,
+                    alert_name=f"regular_alert_{i}",
+                    alert_query="q=testing_query&type=r",
+                    alert_type=SEARCH_TYPES.DOCKETS,
+                )
+                self.assertEqual(response.status_code, HTTPStatus.CREATED)
+
+            # The fourth write exceeds the global throttle.
+            response = await self.make_an_alert(
+                client,
+                alert_name="regular_alert_3",
+                alert_query="q=testing_query&type=r",
+                alert_type=SEARCH_TYPES.DOCKETS,
+            )
+            self.assertEqual(
+                response.status_code, HTTPStatus.TOO_MANY_REQUESTS
+            )
+
+    async def test_commercial_reads_do_not_consume_write_budget(
+        self,
+    ) -> None:
+        """A commercial user's reads use the global throttle, not the
+        AlertThrottle, so polling their alert list neither gets rejected by the
+        alert rate nor consumes their alert-write budget.
+        """
+        commercial_user = (
+            await sync_to_async(UserProfileWithParentsFactory)()
+        ).user
+        # A tight alert throttle: if reads counted against it, the GETs below
+        # would 429 and/or starve the writes.
+        await sync_to_async(APIThrottleFactory)(
+            user=commercial_user,
+            throttle_type=ThrottleType.ALERTS,
+            rate="2/min",
+        )
+        await sync_to_async(clear_tiered_cache)()
+        client = await sync_to_async(make_client)(commercial_user.pk)
+
+        # Five list reads, more than the 2/min alert rate; none are throttled
+        # because reads fall back to the generous global user throttle.
+        for _ in range(5):
+            response = await client.get(self.alert_path)
+            self.assertEqual(response.status_code, HTTPStatus.OK)
+
+        with mock.patch(
+            "cl.alerts.api_serializers.get_alert_estimation_count",
+            return_value=(0, 0),
+        ):
+            # The full 2/min write budget is still available after the reads.
+            for i in range(2):
+                response = await self.make_an_alert(
+                    client,
+                    alert_name=f"read_budget_alert_{i}",
+                    alert_query="q=testing_query&type=r",
+                    alert_type=SEARCH_TYPES.DOCKETS,
+                )
+                self.assertEqual(response.status_code, HTTPStatus.CREATED)
+        self.assertEqual(
+            await Alert.objects.filter(user=commercial_user).acount(), 2
+        )
 
 
 @mock.patch("cl.search.tasks.percolator_alerts_models_supported", new=[Audio])
@@ -2045,7 +2694,7 @@ class DocketAlertAPITests(APITestCase):
         cls.user_1 = UserFactory()
         cls.user_2 = UserFactory()
 
-        cls.court = Court.objects.get(id="scotus")
+        cls.court = CourtFactory(id="scotus", jurisdiction="F")
         cls.docket = DocketFactory(
             case_name="BARTON v. State Board for Rodgers Educator Certification",
             docket_number_core="0600078",
@@ -2476,6 +3125,111 @@ class OldDocketAlertsReportToggleTest(TestCase):
         self.assertEqual(da.date_modified, eighty_five_days_ahead)
 
 
+class ToggleDocketAlertHtmxTest(TestCase):
+    """The docket alert toggle answers htmx requests with a v2 fragment."""
+
+    FRAGMENT = "v2_includes/docket_alerts_htmx/toggle.html"
+
+    @classmethod
+    def setUpTestData(cls) -> None:
+        cls.profile = UserProfileWithParentsFactory()
+        cls.docket = DocketFactory(source=Docket.RECAP)
+
+    def setUp(self) -> None:
+        self.client.force_login(self.profile.user)
+
+    def toggle(self) -> "_MonkeyPatchedWSGIResponse":
+        """Posts the toggle the way the v2 docket page does."""
+        return self.client.post(
+            reverse("toggle_docket_alert"),
+            {"id": self.docket.pk},
+            headers={"HX-Request": "true"},
+        )
+
+    def subscriptions(self) -> int:
+        """How many active alerts the user has on the docket."""
+        return DocketAlert.objects.filter(
+            user=self.profile.user,
+            docket=self.docket,
+            alert_type=DocketAlert.SUBSCRIPTION,
+        ).count()
+
+    def test_legacy_request_keeps_the_legacy_response(self) -> None:
+        """A non-htmx, non-ajax POST is still refused as before."""
+        r = self.client.post(
+            reverse("toggle_docket_alert"), {"id": self.docket.pk}
+        )
+        self.assertEqual(r.status_code, HTTPStatus.METHOD_NOT_ALLOWED)
+
+    def test_htmx_creates_the_alert(self) -> None:
+        """The first toggle subscribes and swaps in the subscribed state."""
+        self.assertEqual(self.subscriptions(), 0)
+        r = self.toggle()
+        self.assertEqual(r.status_code, HTTPStatus.OK)
+        self.assertTemplateUsed(r, self.FRAGMENT)
+        self.assertEqual(self.subscriptions(), 1)
+        self.assertTrue(r.context["has_alert"])
+        self.assertContains(r, f'id="docket-alert-label-{self.docket.pk}"')
+        self.assertContains(r, f'id="docket-alert-toggle-{self.docket.pk}"')
+        self.assertContains(r, f'id="docket-alert-status-{self.docket.pk}"')
+        self.assertContains(r, 'hx-swap-oob="innerHTML"', count=3)
+
+    def test_htmx_disables_the_alert(self) -> None:
+        """Toggling a subscribed docket unsubscribes it."""
+        self.toggle()
+        r = self.toggle()
+        self.assertEqual(self.subscriptions(), 0)
+        self.assertTemplateUsed(r, self.FRAGMENT)
+        self.assertFalse(r.context["has_alert"])
+
+    @override_settings(MAX_FREE_DOCKET_ALERTS=0)
+    def test_htmx_refuses_to_subscribe_over_quota(self) -> None:
+        """A user at quota gets no alert, even without the page's dialog."""
+        r = self.toggle()
+        self.assertEqual(r.status_code, HTTPStatus.OK)
+        self.assertEqual(self.subscriptions(), 0)
+        self.assertFalse(r.context["has_alert"])
+
+    @override_settings(MAX_FREE_DOCKET_ALERTS=1)
+    def test_htmx_allows_disabling_at_quota(self) -> None:
+        """Quota never blocks turning an alert off."""
+        self.toggle()
+        r = self.toggle()
+        self.assertEqual(self.subscriptions(), 0)
+        self.assertFalse(r.context["has_alert"])
+
+    def test_htmx_without_id_is_a_bad_request(self) -> None:
+        """A missing or malformed docket id is the caller's error.
+
+        Superscript two passes str.isdigit() but int() rejects it, so a
+        looser check would let it through to a 500 in the query.
+        """
+        for data in ({}, {"id": "abc"}, {"id": "²"}):
+            with self.subTest(data=data):
+                r = self.client.post(
+                    reverse("toggle_docket_alert"),
+                    data,
+                    headers={"HX-Request": "true"},
+                )
+                self.assertEqual(r.status_code, HTTPStatus.BAD_REQUEST)
+
+    def test_htmx_unknown_docket_is_not_found(self) -> None:
+        """A well-formed id for a docket that does not exist is a 404."""
+        r = self.client.post(
+            reverse("toggle_docket_alert"),
+            {"id": self.docket.pk + 100000},
+            headers={"HX-Request": "true"},
+        )
+        self.assertEqual(r.status_code, HTTPStatus.NOT_FOUND)
+
+    def test_htmx_from_a_logged_out_user_redirects_to_login(self) -> None:
+        """Logged-out users are sent to sign in, never handed a fragment."""
+        self.client.logout()
+        r = self.toggle()
+        self.assertEqual(r.status_code, HTTPStatus.FOUND)
+        self.assertIn(reverse("sign-in"), r["Location"])
+
+
 class OldDocketAlertsWebhooksTest(TestCase):
     """Test Old Docket Alerts Webhooks"""
 
@@ -2729,7 +3483,7 @@ class DocketAlertGetNotesTagsTests(TestCase):
     def setUpTestData(cls) -> None:
         cls.user_1 = UserFactory()
         cls.user_2 = UserFactory()
-        cls.court = Court.objects.get(id="scotus")
+        cls.court = CourtFactory(id="scotus", jurisdiction="F")
         cls.docket_1 = DocketFactory(
             court=cls.court,
         )
@@ -2739,10 +3493,19 @@ class DocketAlertGetNotesTagsTests(TestCase):
         cls.docket_3 = DocketFactory(
             court=cls.court,
         )
+        cls.docket_4 = DocketFactory(
+            court=cls.court,
+        )
         cls.note_docket_1_user_1 = NoteFactory(
             user=cls.user_1,
             docket_id=cls.docket_1,
             notes="Note 1 Test",
+        )
+        # GFK-shaped note (#7725) -- proves the lookup isn't legacy-only.
+        cls.note_docket_4_user_1 = NoteFactory.for_object(
+            cls.docket_4,
+            user=cls.user_1,
+            notes="Note 4 Test",
         )
         cls.note_docket_2_user_1 = NoteFactory(
             user=cls.user_1,
@@ -2803,6 +3566,14 @@ class DocketAlertGetNotesTagsTests(TestCase):
         ) = get_docket_notes_and_tags_by_user(self.docket_3.pk, self.user_1.pk)
         self.assertEqual(notes_docket_3_user_1, None)
         self.assertEqual(tags_docket_3_user_1, [])
+
+        # GFK-shaped note (#7725) -- must be found too, not just legacy ones.
+        (
+            notes_docket_4_user_1,
+            tags_docket_4_user_1,
+        ) = get_docket_notes_and_tags_by_user(self.docket_4.pk, self.user_1.pk)
+        self.assertEqual(notes_docket_4_user_1, "Note 4 Test")
+        self.assertEqual(tags_docket_4_user_1, [])
 
 
 @mock.patch("cl.search.tasks.percolator_alerts_models_supported", new=[Audio])
@@ -3001,24 +3772,24 @@ class SearchAlertsOAESTests(
         # Two OA search alert emails should be sent, one for user_profile and
         # one for user_profile_2
         self.assertEqual(len(mail.outbox), 2)
-        text_content = mail.outbox[0].body
-        self.assertEqual(
-            mail.outbox[0].subject,
-            f"1 Alert has hits: {self.search_alert.name}",
-        )
+        emails_by_subject = {email.subject: email for email in mail.outbox}
+        alert_subject = f"1 Alert has hits: {self.search_alert.name}"
+        self.assertIn(alert_subject, emails_by_subject)
+        alert_email = emails_by_subject[alert_subject]
+        text_content = alert_email.body
 
         self.assertIn(rt_oral_argument.case_name, text_content)
 
         # Should have the List-Unsubscribe-Post and List-Unsubscribe header
         # because the email only includes one alert.
-        self.assertIn("List-Unsubscribe", mail.outbox[0].extra_headers)
-        self.assertIn("List-Unsubscribe-Post", mail.outbox[0].extra_headers)
+        self.assertIn("List-Unsubscribe", alert_email.extra_headers)
+        self.assertIn("List-Unsubscribe-Post", alert_email.extra_headers)
         unsubscribe_url = reverse(
             "one_click_disable_alert", args=[self.search_alert.secret_key]
         )
         self.assertIn(
             unsubscribe_url,
-            mail.outbox[0].extra_headers["List-Unsubscribe"],
+            alert_email.extra_headers["List-Unsubscribe"],
         )
 
         # Highlighting tags are not set in text version
@@ -3026,7 +3797,7 @@ class SearchAlertsOAESTests(
 
         # Extract HTML version.
         html_content = None
-        for content, content_type in mail.outbox[0].alternatives:
+        for content, content_type in alert_email.alternatives:
             if content_type == "text/html":
                 html_content = content
                 break
@@ -3061,7 +3832,14 @@ class SearchAlertsOAESTests(
         self.assertEqual(len(webhook_events), 4)
 
         # Compare webhook content.
-        content = webhook_events[0].content
+        matching = [
+            event.content
+            for event in webhook_events
+            if event.content["payload"]["alert"]["query"]
+            == self.search_alert.query
+        ]
+        self.assertEqual(len(matching), 1)
+        content = matching[0]
         self.assertEqual(
             content["payload"]["alert"]["query"], self.search_alert.query
         )
@@ -3190,7 +3968,8 @@ class SearchAlertsOAESTests(
         # Two OA search alert emails should be sent, one for user_profile and
         # one for user_profile_2
         self.assertEqual(len(mail.outbox), 2)
-        text_content = mail.outbox[0].body
+        emails_by_recipient = {email.to[0]: email for email in mail.outbox}
+        text_content = emails_by_recipient[self.user_profile.user.email].body
         self.assertIn(rt_oral_argument.case_name, text_content)
 
         # 4 webhook events should be sent to user_profile.
@@ -3218,7 +3997,8 @@ class SearchAlertsOAESTests(
         call_command("cl_send_rt_percolator_alerts", testing_mode=True)
         # New alerts shouldn't be sent. Since document was just updated.
         self.assertEqual(len(mail.outbox), 2)
-        text_content = mail.outbox[0].body
+        emails_by_recipient = {email.to[0]: email for email in mail.outbox}
+        text_content = emails_by_recipient[self.user_profile.user.email].body
         self.assertIn(rt_oral_argument.case_name, text_content)
 
         # No new webhook events should be triggered.
@@ -4169,29 +4949,32 @@ class SearchAlertsOAESTests(
 
         # Two emails should be sent, one for user_profile and one for user_profile_2
         self.assertEqual(len(mail.outbox), 2)
+        emails_by_recipient = {email.to[0]: email for email in mail.outbox}
+        first_email = emails_by_recipient[self.user_profile.user.email]
+        second_email = emails_by_recipient[self.user_profile_2.user.email]
 
         # Confirm emails contains the hits+ count.
         self.assertIn(
             f"had {settings.SCHEDULED_ALERT_HITS_LIMIT}+ hits",
-            mail.outbox[0].body,
+            first_email.body,
         )
         # No "+" if hits do not reach the SCHEDULED_ALERT_HITS_LIMIT.
         self.assertIn(
             "had 2 hits",
-            mail.outbox[1].body,
+            second_email.body,
         )
 
         # Confirm each email contains the max number of hits for each alert.
         self.assertEqual(
-            mail.outbox[0].body.count("USA vs Bank"),
+            first_email.body.count("USA vs Bank"),
             settings.SCHEDULED_ALERT_HITS_LIMIT,
         )
         self.assertEqual(
-            mail.outbox[0].body.count("Texas vs Corp"),
+            first_email.body.count("Texas vs Corp"),
             2,
         )
         self.assertEqual(
-            mail.outbox[1].body.count("Texas vs Corp"),
+            second_email.body.count("Texas vs Corp"),
             2,
         )
 
@@ -4367,6 +5150,83 @@ class SearchAlertsIndexingCommandTests(ESIndexTestCase, TestCase):
         self.assertTrue(
             AudioPercolator.exists(id=valid_alert.pk),
             msg=f"Alert id: {valid_alert.pk} was not indexed.",
+        )
+
+
+class FetchAllSearchAlertsResultsTest(SimpleTestCase):
+    class FakeHits:
+        def __init__(self, total, markers):
+            self.total = SimpleNamespace(value=total)
+            self.hits = [
+                SimpleNamespace(meta=SimpleNamespace(sort=[marker]))
+                for marker in markers
+            ]
+
+        def __iter__(self):
+            return iter(self.hits)
+
+        def __getitem__(self, item):
+            return self.hits[item]
+
+    @classmethod
+    def make_response(cls, total, *markers):
+        return SimpleNamespace(hits=cls.FakeHits(total, markers))
+
+    @override_settings(ELASTICSEARCH_PAGINATION_BATCH_SIZE=1)
+    @mock.patch("cl.alerts.utils.percolate_es_document")
+    def test_paginates_dataclass_responses(self, mock_percolate):
+        initial = PercolatorResponses(
+            self.make_response(3, "main-1"),
+            self.make_response(1, "rd-1"),
+            self.make_response(1, "d-1"),
+        )
+        mock_percolate.side_effect = [
+            PercolatorResponses(
+                self.make_response(3, "main-2"),
+                self.make_response(1, "rd-2"),
+                self.make_response(1, "d-2"),
+            ),
+            PercolatorResponses(
+                self.make_response(3, "main-3"),
+                self.make_response(1, "rd-3"),
+                self.make_response(1, "d-3"),
+            ),
+        ]
+
+        main_hits, rd_hits, d_hits = fetch_all_search_alerts_results(
+            initial, "document-id", "percolator-index"
+        )
+
+        self.assertEqual(len(main_hits), 3)
+        self.assertEqual(len(rd_hits), 3)
+        self.assertEqual(len(d_hits), 3)
+        self.assertEqual(mock_percolate.call_count, 2)
+
+    @override_settings(ELASTICSEARCH_PAGINATION_BATCH_SIZE=1)
+    @mock.patch("cl.alerts.utils.percolate_es_document")
+    def test_handles_empty_auxiliary_responses(self, mock_percolate):
+        initial = PercolatorResponses(
+            self.make_response(2, "main-1"),
+            self.make_response(0),
+            self.make_response(0),
+        )
+        mock_percolate.return_value = PercolatorResponses(
+            self.make_response(2, "main-2"), None, None
+        )
+
+        main_hits, rd_hits, d_hits = fetch_all_search_alerts_results(
+            initial, "document-id", "percolator-index"
+        )
+
+        self.assertEqual(len(main_hits), 2)
+        self.assertEqual(rd_hits, [])
+        self.assertEqual(d_hits, [])
+        mock_percolate.assert_called_once_with(
+            "document-id",
+            "percolator-index",
+            main_search_after=["main-1"],
+            rd_search_after=None,
+            d_search_after=None,
         )
 
 

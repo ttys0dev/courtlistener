@@ -20,6 +20,8 @@ from cl.search.factories import (
     OpinionWithParentsFactory,
     ParentheticalWithParentsFactory,
     RECAPDocumentFactory,
+    SCOTUSDocketEntryFactory,
+    SCOTUSDocumentFactory,
 )
 from cl.search.state.texas.factories import (
     TexasDocketEntryFactory,
@@ -58,6 +60,9 @@ FACTORIES = {
     # Texas
     800: TexasDocketEntryFactory,
     801: TexasDocumentFactory,
+    # SCOTUS
+    900: SCOTUSDocketEntryFactory,
+    901: SCOTUSDocumentFactory,
 }
 factories_str = "\n".join(f"{k}: {v}" for k, v in FACTORIES.items())
 
@@ -140,7 +145,7 @@ class Command(VerboseCommand):
             for object_type in options["make_objects"]:
                 Factory = FACTORIES[object_type]
                 logger.info(
-                    f"Making {count} items and their dependant parents using "
+                    f"Making {count} items and their dependent parents using "
                     f"object type #{object_type}: {Factory}"
                 )
                 if parent_id:

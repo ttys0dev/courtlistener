@@ -6,7 +6,9 @@ from unittest import TestLoader
 from django.test import SimpleTestCase
 from django.test.runner import DiscoverRunner
 from override_storage import override_storage
+from xmlrunner import XMLTestRunner
 
+from cl.lib.redis_utils import get_redis_interface
 from cl.tests.cases import (
     APITestCase,
     LiveServerTestCase,
@@ -41,9 +43,15 @@ class OurCasesTestLoader(TestLoader):
 class TestRunner(DiscoverRunner):
     test_loader = OurCasesTestLoader()
 
-    def __init__(self, *args, enable_logging, **kwargs):
+    def __init__(self, *args, enable_logging, xml_output=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.enable_logging = enable_logging
+        self.xml_output = xml_output
+        if xml_output:
+            # Shadow DiscoverRunner.test_runner for this instance only, so
+            # run_suite() builds an XMLTestRunner. Leaving the class attribute
+            # alone keeps the default text runner for everyone else.
+            self.test_runner = XMLTestRunner
 
     @classmethod
     def add_arguments(cls, parser):
@@ -53,6 +61,11 @@ class TestRunner(DiscoverRunner):
             action="store_true",
             default=False,
             help="Display all log lines",
+        )
+        parser.add_argument(
+            "--xml-output",
+            default=None,
+            help="Directory to write JUnit XML test results to",
         )
         super().add_arguments(parser)
 
@@ -68,6 +81,17 @@ class TestRunner(DiscoverRunner):
         # This is disabled due to Django bug #36491.
         # See PR #5888 for more details.
         # parser.set_defaults(buffer=True)
+
+    def get_test_runner_kwargs(self):
+        """Build the kwargs for the test runner.
+
+        Adds XMLTestRunner's ``output`` directory when ``--xml-output`` was
+        passed; otherwise returns Django's defaults untouched.
+        """
+        kwargs = super().get_test_runner_kwargs()
+        if self.xml_output:
+            kwargs["output"] = self.xml_output
+        return kwargs
 
     def setup_databases(self, **kwargs):
         # Force to always delete the database if it exists
@@ -88,4 +112,24 @@ class TestRunner(DiscoverRunner):
         if not self.enable_logging:
             logging.disable()
 
-        return super().run_tests(*args, **kwargs)
+        try:
+            return super().run_tests(*args, **kwargs)
+        finally:
+            self.clear_throttle_keys()
+
+    @staticmethod
+    def clear_throttle_keys():
+        """Drop DRF's rate-limit counters left behind by the run.
+
+        They live in the shared Redis cache, are keyed by user pk -- which
+        test factories recycle across runs -- and carry day-long TTLs, so a
+        run that doesn't clean up makes the *next* run's API tests fail with
+        429s that have nothing to do with the code under test.
+
+        Done once here rather than in a tearDown: under --parallel every
+        worker shares this Redis, so deleting mid-run would wipe counters a
+        sibling worker's throttle test is still relying on.
+        """
+        r = get_redis_interface("CACHE")
+        if keys := r.keys(":1:throttle_*"):
+            r.delete(*keys)

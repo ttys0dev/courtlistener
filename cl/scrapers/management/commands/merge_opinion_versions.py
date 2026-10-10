@@ -4,13 +4,15 @@ from collections import defaultdict
 from difflib import Differ, SequenceMatcher
 
 from django.db import transaction
-from django.db.models import Count, F, Q, QuerySet
+from django.db.models import Count, F, Q, QuerySet, Value
+from django.db.models.functions import Greatest
 from eyecite import clean_text
 
 from cl.alerts.models import DocketAlert
 from cl.audio.models import Audio
 from cl.citations.parenthetical_utils import create_parenthetical_groups
-from cl.favorites.models import DocketTag, Note
+from cl.favorites.models import DocketTag
+from cl.favorites.utils import repoint_notes
 from cl.lib.command_utils import VerboseCommand, logger
 from cl.people_db.models import (
     AttorneyOrganizationAssociation,
@@ -122,7 +124,6 @@ models_that_reference_docket = [
     (DocketAlert, "docket", "user_id"),
     (Audio, "docket", None),
     (DocketTags, "docket", None),
-    (Note, "docket_id", "user_id"),
     (
         AttorneyOrganizationAssociation,
         "docket",
@@ -144,11 +145,6 @@ models_that_reference_docket = [
 
 models_that_reference_cluster = [
     # (model, related name to the cluster, unique together field)
-    (
-        Note,
-        "cluster_id",
-        "user_id",
-    ),
     (Opinion, "cluster", None),
     (OpinionClusterPanel, "opinioncluster", "person_id"),
     (OpinionClusterNonParticipatingJudges, "opinioncluster", "person_id"),
@@ -467,9 +463,16 @@ def update_referencing_objects(
     - there is a single key constraint (like JoinedBy -> Opinion)
     - there are multiple key constraints (like Citation -> OpinionCluster)
 
+    Notes are repointed separately, via repoint_notes(): they can be in
+    either of two shapes (dual-read, #7725), which the generic
+    single-FK-field handling above can't account for.
+
     :param main_object: the main version OpinionCluster or Docket
     :param version_object: the secondary version OpinionCluster or Docket
     """
+    if isinstance(main_object, (OpinionCluster, Docket)):
+        repoint_notes(main_object, version_object)
+
     if isinstance(main_object, OpinionCluster):
         referencing_models = models_that_reference_cluster
     elif isinstance(main_object, Docket):
@@ -629,7 +632,7 @@ def delete_version_related_objects(version: Opinion) -> None:
     )
     if cited_clusters:
         OpinionCluster.objects.filter(id__in=list(cited_clusters)).update(
-            citation_count=F("citation_count") - 1
+            citation_count=Greatest(F("citation_count") - 1, Value(0))
         )
 
     OpinionsCited.objects.filter(
